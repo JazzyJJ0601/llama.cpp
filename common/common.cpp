@@ -1554,6 +1554,10 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.progress_callback_user_data = params.load_progress_callback_user_data;
     mparams.no_alloc                    = params.no_alloc;
 
+    mparams.helix_sidecar_path = params.helix_sidecar_path.empty()
+        ? nullptr
+        : params.helix_sidecar_path.c_str();
+
     return mparams;
 }
 

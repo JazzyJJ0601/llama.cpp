@@ -324,6 +324,9 @@ extern "C" {
         bool use_extra_bufts; // use extra buffer types (used for weight repacking)
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
+
+        // path to external Helix routing sidecar (self-describing binary); NULL = disabled
+        const char * helix_sidecar_path;
     };
 
     struct llama_sampler_seq_config {
@@ -1571,6 +1574,25 @@ extern "C" {
             int64_t                   idata_split,
             ggml_opt_epoch_callback   callback_train,
             ggml_opt_epoch_callback   callback_eval);
+
+    // Helix Doppelgänger / Magnet sparsity stats (enable inference with HELIX_DOPPELGANGER=1).
+    // Reset before each generation; read after decode to print measured FFN activation.
+    struct helix_sparsity_stats {
+        int32_t n_dense_layers;
+        int32_t n_magnet_layers;
+        int32_t n_gate_layers;
+        double  active_neuron_pct;       // measured mask activation, whole request (prompt+decode)
+        double  active_neuron_decode_pct; // measured on decode tokens only (n_tokens==1 forwards)
+        double  active_budget_pct;       // design top-k sparse budget (~22% for magnet layers)
+        double  ffn_flop_saved_pct;     // hypothetical savings if masked, from measured activation
+        bool    engine_active;
+        bool    active_neuron_measured;  // true after cb_eval sampled magnet_mask tensors
+        uint64_t mask_reads;            // magnet_mask tensor reads (≈ 25 × forward passes)
+        uint64_t decode_mask_reads;     // mask reads during decode-only forwards
+    };
+
+    LLAMA_API void llama_helix_sparsity_reset(void);
+    LLAMA_API bool llama_helix_sparsity_get(struct helix_sparsity_stats * out);
 
 #ifdef __cplusplus
 }

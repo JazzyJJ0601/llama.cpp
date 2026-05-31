@@ -14,6 +14,7 @@
 
 #include <cinttypes>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -82,6 +83,22 @@ llama_context::llama_context(
 
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
+
+    if (cparams.cb_eval == nullptr && (helix_env_flag_enabled("HELIX_TRACE") ||
+            helix_env_flag_enabled("HELIX_ACTIVATION_CACHE") ||
+            helix_env_flag_enabled("HELIX_DOPPELGANGER"))) {
+        cparams.cb_eval           = helix_runtime_cb_eval;
+        cparams.cb_eval_user_data = nullptr;
+        if (helix_env_flag_enabled("HELIX_TRACE")) {
+            LLAMA_LOG_INFO("%s: HELIX_TRACE enabled — dumping layers 0 and 19 routing tensors\n", __func__);
+        }
+        if (helix_env_flag_enabled("HELIX_ACTIVATION_CACHE")) {
+            LLAMA_LOG_INFO("%s: HELIX_ACTIVATION_CACHE enabled — streaming native pre-MLP activations\n", __func__);
+        }
+        if (helix_env_flag_enabled("HELIX_DOPPELGANGER")) {
+            LLAMA_LOG_INFO("%s: HELIX_DOPPELGANGER enabled — measuring sparse FFN activation each token\n", __func__);
+        }
+    }
 
     cparams.ctx_type          = params.ctx_type;
 

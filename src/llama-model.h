@@ -288,6 +288,18 @@ struct llama_layer {
     struct ggml_tensor * ffn_down_enc = nullptr;
     struct ggml_tensor * ffn_up_enc   = nullptr;
 
+    // DNPA Helix sparse routing
+    struct ggml_tensor * helix_router_gate = nullptr;
+    struct ggml_tensor * helix_cluster_map = nullptr;
+    struct ggml_tensor * helix_ffn_gate_exps = nullptr;
+    struct ggml_tensor * helix_ffn_up_exps   = nullptr;
+    struct ggml_tensor * helix_ffn_down_exps = nullptr;
+    struct ggml_tensor * helix_shared_core_gate = nullptr;
+    struct ggml_tensor * helix_shared_core_up   = nullptr;
+    struct ggml_tensor * helix_shared_core_down = nullptr;
+    struct ggml_tensor * helix_magnet_a = nullptr;
+    struct ggml_tensor * helix_magnet_b = nullptr;
+
     // ff MoE
     struct ggml_tensor * ffn_gate_inp      = nullptr;
     struct ggml_tensor * ffn_gate_inp_s    = nullptr; // gemma4
@@ -628,6 +640,12 @@ struct llama_model {
 
     ggml_cgraph * build_graph(const llm_graph_params & params) const;
 
+    // load Helix DNPA routing metadata from a self-describing external sidecar binary
+    void load_helix_sidecar(const std::string & filename);
+
+    // Verify helix_cluster_map matches cluster-contiguous permuted weights (map[i] == i / cluster_width).
+    void validate_helix_layout();
+
     virtual void load_stats  (llama_model_loader & ml) = 0;
     virtual void load_hparams(llama_model_loader & ml) = 0;
     virtual void load_vocab  (llama_model_loader & ml) = 0;
@@ -667,6 +685,10 @@ struct llama_model_base : public llama_model {
 
     ggml_tensor * create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
 
+    // Helix metadata tensors stay on host (I32 cluster map, small router gate).
+    ggml_tensor * create_tensor_cpu(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
+    ggml_tensor * create_tensor_cpu(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
+
     // convenience overload of create_tensor that doesn't require llama_model_loader
     ggml_tensor * create_tensor(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
 
@@ -691,6 +713,8 @@ struct llama_model_base : public llama_model {
 };
 
 const char * llm_type_name(llm_type type);
+
+void llama_model_load_helix_sidecar(const std::string & filename, llama_model & model);
 
 // convenience macro for loading local variables for load_tensors() in llama_model_base
 // note: cast to int64_t since we will use these for the tensor dimensions

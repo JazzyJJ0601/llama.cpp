@@ -503,6 +503,8 @@ struct common_params {
 
     std::vector<common_control_vector_load_info> control_vectors; // control vector with user defined scale
 
+    std::string helix_sidecar_path = ""; // external Helix routing sidecar binary (self-describing)
+
     int32_t verbosity                  = 3;  // LOG_LEVEL_INFO
     int32_t control_vector_layer_start = -1; // layer range for control vector
     int32_t control_vector_layer_end   = -1; // layer range for control vector

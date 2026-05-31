@@ -173,6 +173,18 @@ struct cli_context {
             auto res_final = dynamic_cast<server_task_result_cmpl_final *>(result.get());
             if (res_final) {
                 out_timings = std::move(res_final->timings);
+                if (res_final->stop == STOP_TYPE_LIMIT || res_final->truncated) {
+                    console::set_display(DISPLAY_TYPE_INFO);
+                    if (res_final->truncated) {
+                        console::log("\n[Stopped: context full — try /clear or a larger --ctx-size]\n");
+                    } else {
+                        console::log(
+                            "\n[Stopped: -n/--predict limit (%d tokens generated). "
+                            "Thinking and reply share one budget — use -n 4096 or -n -1]\n",
+                            res_final->n_decoded);
+                    }
+                    console::set_display(DISPLAY_TYPE_RESET);
+                }
                 break;
             }
             result = rd.next(should_stop);
@@ -622,6 +634,9 @@ int llama_cli(int argc, char ** argv) {
             cur_msg.clear();
         }
         result_timings timings;
+        if (std::getenv("HELIX_DOPPELGANGER")) {
+            llama_helix_sparsity_reset();
+        }
         std::string assistant_content = ctx_cli.generate_completion(timings);
         ctx_cli.messages.push_back({
             {"role",    "assistant"},
@@ -633,6 +648,48 @@ int llama_cli(int argc, char ** argv) {
             console::set_display(DISPLAY_TYPE_INFO);
             console::log("\n");
             console::log("[ Prompt: %.1f t/s | Generation: %.1f t/s ]\n", timings.prompt_per_second, timings.predicted_per_second);
+            if (std::getenv("HELIX_DOPPELGANGER")) {
+                helix_sparsity_stats st {};
+                if (llama_helix_sparsity_get(&st) && st.engine_active) {
+                    const bool sparse_gather = std::getenv("HELIX_MAGNET_GATHER") != nullptr;
+                    const bool sparse_ffn    = std::getenv("HELIX_MAGNET_SPARSE") != nullptr;
+                    const char * ffn_mode = sparse_gather ? "row gather"
+                        : (sparse_ffn ? "top-k masked" : "dense");
+                    const bool mask_applied = std::getenv("HELIX_MAGNET_APPLY_MASK") != nullptr;
+                    if (st.n_magnet_layers > 0) {
+                        if (st.active_neuron_measured) {
+                            console::log(
+                                "[ Helix Magnet: %d magnet + %d dense | %.2f%% active all-tokens (measured) "
+                                "| %.2f%% active decode-only | %.1f%% sparse budget | %llu mask reads (%llu decode) "
+                                "| FFN %s | ~%.0f%% FLOP savings (sparse layers) ]\n",
+                                st.n_magnet_layers, st.n_dense_layers, st.active_neuron_pct,
+                                st.active_neuron_decode_pct, st.active_budget_pct,
+                                (unsigned long long) st.mask_reads,
+                                (unsigned long long) st.decode_mask_reads,
+                                ffn_mode, st.ffn_flop_saved_pct);
+                        } else {
+                            console::log(
+                                "[ Helix Magnet: %d magnet + %d dense | (no live mask samples — rebuild llama-cli) "
+                                "| %.1f%% sparse budget | FFN %s ]\n",
+                                st.n_magnet_layers, st.n_dense_layers, st.active_budget_pct,
+                                ffn_mode);
+                        }
+                    } else {
+                        if (st.active_neuron_measured) {
+                            console::log(
+                                "[ Helix Doppelgänger: %d gate-masked + %d dense | %.1f%% active (measured) "
+                                "| ~%.0f%% FFN FLOPs saved if masked ]\n",
+                                st.n_gate_layers, st.n_dense_layers, st.active_neuron_pct, st.ffn_flop_saved_pct);
+                        } else {
+                            console::log(
+                                "[ Helix Doppelgänger: %d gate-masked + %d dense | (no live samples) ]\n",
+                                st.n_gate_layers, st.n_dense_layers);
+                        }
+                    }
+                } else {
+                    console::log("[ Helix: HELIX_DOPPELGANGER on — magnet path not active (missing magnet tensors in GGUF?) ]\n");
+                }
+            }
             console::set_display(DISPLAY_TYPE_RESET);
         }
 

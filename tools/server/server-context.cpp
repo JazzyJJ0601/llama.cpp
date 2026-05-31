@@ -387,8 +387,13 @@ struct server_slot {
 
         timings.predicted_n            = n_decoded;
         timings.predicted_ms           = t_token_generation;
-        timings.predicted_per_token_ms = t_token_generation / n_decoded;
-        timings.predicted_per_second   = 1e3 / t_token_generation * n_decoded;
+        if (n_decoded > 0 && t_token_generation > 0.0) {
+            timings.predicted_per_token_ms = t_token_generation / n_decoded;
+            timings.predicted_per_second   = 1e3 / t_token_generation * n_decoded;
+        } else {
+            timings.predicted_per_token_ms = 0.0;
+            timings.predicted_per_second   = 0.0;
+        }
 
         // Add speculative metrics
         if (n_draft_total > 0) {

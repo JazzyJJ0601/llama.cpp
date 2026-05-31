@@ -15,6 +15,7 @@
 struct ggml_cgraph;
 struct ggml_context;
 struct ggml_tensor;
+struct helix_sparsity_stats;
 
 struct llama_cparams;
 struct llama_layer;
@@ -871,6 +872,24 @@ struct llm_graph_context {
                   int64_t   n_head_kv,
                       int   il) const;
 
+    ggml_tensor * build_helix_dnpa_sparse_ffn(
+        ggml_context * ctx0,
+        ggml_tensor * cur,
+        ggml_tensor * ffn_up,
+        ggml_tensor * ffn_gate,
+        ggml_tensor * ffn_down,
+        ggml_tensor * helix_ffn_gate_exps,
+        ggml_tensor * helix_ffn_up_exps,
+        ggml_tensor * helix_ffn_down_exps,
+        ggml_tensor * helix_router_gate,
+        ggml_tensor * helix_cluster_map,
+        int           il,
+        ggml_tensor * helix_shared_core_gate = nullptr,
+        ggml_tensor * helix_shared_core_up   = nullptr,
+        ggml_tensor * helix_shared_core_down = nullptr,
+        ggml_tensor * helix_magnet_a = nullptr,
+        ggml_tensor * helix_magnet_b = nullptr) const;
+
     ggml_tensor * build_ffn(
              ggml_tensor * cur,
              ggml_tensor * up,
@@ -885,7 +904,17 @@ struct llm_graph_context {
              ggml_tensor * act_scales,
          llm_ffn_op_type   type_op,
        llm_ffn_gate_type   type_gate,
-                     int   il) const;
+                     int   il,
+             ggml_tensor * helix_router_gate = nullptr,
+             ggml_tensor * helix_cluster_map = nullptr,
+             ggml_tensor * helix_ffn_gate_exps = nullptr,
+             ggml_tensor * helix_ffn_up_exps   = nullptr,
+             ggml_tensor * helix_ffn_down_exps = nullptr,
+             ggml_tensor * helix_shared_core_gate = nullptr,
+             ggml_tensor * helix_shared_core_up   = nullptr,
+             ggml_tensor * helix_shared_core_down = nullptr,
+             ggml_tensor * helix_magnet_a = nullptr,
+             ggml_tensor * helix_magnet_b = nullptr) const;
 
     // build MoE FFN without bias tensors
     ggml_tensor * build_moe_ffn(
@@ -1139,3 +1168,11 @@ struct llm_graph_context {
 
 // TODO: better name
 int32_t llama_relative_position_bucket(llama_pos x, llama_pos y, uint64_t n_buckets, bool bidirectional);
+
+// Runtime Helix routing trace (enable with HELIX_TRACE=1); wired from llama_context when cb_eval unset.
+bool helix_env_flag_enabled(const char * name);
+bool helix_trace_cb_eval(struct ggml_tensor * t, bool ask, void * user_data);
+bool helix_runtime_cb_eval(struct ggml_tensor * t, bool ask, void * user_data);
+void helix_trace_set_ubatch_tokens(const llama_ubatch * ubatch);
+void helix_sparsity_reset(void);
+bool helix_sparsity_get(struct helix_sparsity_stats * out);

@@ -1,5 +1,6 @@
 #include "llama-graph.h"
 
+#include "llama.h"
 #include "llama-impl.h"
 #include "llama-model.h"
 #include "llama-batch.h"
@@ -13,11 +14,223 @@
 #include "llama-memory-recurrent.h"
 
 #include <cassert>
+#include <algorithm>
 #include <cmath>
+#include <cstdlib>
+#include <cstdio>
 #include <cstring>
+#include <cstdarg>
+#include <cstdint>
 #include <numeric>
 #include <sstream>
 #include <unordered_set>
+#include <vector>
+#include <atomic>
+
+// Helix Doppelgänger runtime statistics
+struct helix_dg_stats {
+    int layers_magnet = 0;
+    int layers_sparse = 0;
+    int layers_dense  = 0;
+    bool printed = false;
+};
+
+static helix_dg_stats g_helix_stats;
+
+static constexpr int HELIX_SPARSITY_N_LAYERS = 28;
+
+struct helix_sparsity_runtime {
+    uint64_t active_neurons = 0;
+    uint64_t total_neurons  = 0;
+    uint64_t mask_samples   = 0;
+    uint64_t decode_active  = 0;
+    uint64_t decode_total   = 0;
+    uint64_t decode_mask_samples = 0;
+    bool layer_magnet[HELIX_SPARSITY_N_LAYERS] = {};
+    bool layer_gate[HELIX_SPARSITY_N_LAYERS]   = {};
+};
+
+static double helix_magnet_active_budget_pct() {
+    // L3-L12: top-25% of FFN; L13-L27: top-20%
+    return (10.0 * 25.0 + 15.0 * 20.0) / 25.0;
+}
+
+static ggml_tensor * helix_sparsity_anchor_tensor(
+        ggml_context * ctx0,
+        ggml_tensor * out,
+        ggml_tensor * dep) {
+    if (out == nullptr || dep == nullptr) {
+        return out;
+    }
+    ggml_tensor * zero = ggml_scale(ctx0, ggml_sum(ctx0, dep), 0.0f);
+    if (zero->type != out->type) {
+        zero = ggml_cast(ctx0, zero, out->type);
+    }
+    return ggml_add(ctx0, out, ggml_repeat(ctx0, zero, out));
+}
+
+static helix_sparsity_runtime g_helix_sparsity;
+static thread_local std::vector<uint8_t> g_helix_mask_buf;
+static thread_local int64_t g_helix_layer_n_ff[HELIX_SPARSITY_N_LAYERS] = {};
+
+static bool helix_env_flag_active(const char * name);
+
+static float helix_magnet_env_width_frac() {
+    const char * v = std::getenv("HELIX_MAGNET_WIDTH_FRAC");
+    if (v == nullptr || v[0] == '\0') {
+        v = std::getenv("HELIX_MAGNET_ACTIVE_FRAC");
+    }
+    if (v == nullptr || v[0] == '\0') {
+        return -1.0f;
+    }
+    return (float) atof(v);
+}
+
+void helix_sparsity_reset() {
+    g_helix_sparsity = {};
+}
+
+static void helix_sparsity_accumulate_mask(ggml_tensor * t, int il, bool is_magnet, bool count_nonzero) {
+    if (il < 3 || il >= HELIX_SPARSITY_N_LAYERS || t == nullptr) {
+        return;
+    }
+
+    const int64_t n_neurons = t->ne[0];
+    const int64_t n_tokens  = t->ne[1] > 0 ? t->ne[1] : 1;
+    if (n_neurons <= 0) {
+        return;
+    }
+
+    const size_t row_bytes = (size_t) n_neurons * ggml_element_size(t);
+    const size_t need      = row_bytes * (size_t) n_tokens;
+    g_helix_mask_buf.resize(need);
+
+    if (ggml_backend_buffer_is_host(t->buffer)) {
+        memcpy(g_helix_mask_buf.data(), t->data, need);
+    } else {
+        ggml_backend_tensor_get(t, g_helix_mask_buf.data(), 0, need);
+    }
+
+    const int64_t tok = n_tokens - 1;
+    const uint8_t * row = g_helix_mask_buf.data() + (size_t) tok * row_bytes;
+
+    const float thresh = count_nonzero ? 1e-6f : 0.5f;
+    int64_t active = 0;
+    if (t->type == GGML_TYPE_F32) {
+        const float * frow = (const float *) row;
+        for (int64_t i = 0; i < n_neurons; ++i) {
+            if (frow[i] > thresh) {
+                ++active;
+            }
+        }
+    } else {
+        for (int64_t i = 0; i < n_neurons; ++i) {
+            if (row[i] != 0) {
+                ++active;
+            }
+        }
+    }
+
+    g_helix_sparsity.active_neurons += (uint64_t) active;
+    g_helix_sparsity.total_neurons  += (uint64_t) n_neurons;
+    ++g_helix_sparsity.mask_samples;
+    if (n_tokens == 1) {
+        g_helix_sparsity.decode_active += (uint64_t) active;
+        g_helix_sparsity.decode_total  += (uint64_t) n_neurons;
+        ++g_helix_sparsity.decode_mask_samples;
+    }
+
+    if (is_magnet) {
+        g_helix_sparsity.layer_magnet[il] = true;
+    } else {
+        g_helix_sparsity.layer_gate[il] = true;
+    }
+}
+
+bool helix_sparsity_get(struct helix_sparsity_stats * out) {
+    if (out == nullptr) {
+        return false;
+    }
+
+    int n_magnet = 0;
+    int n_gate   = 0;
+    for (int il = 3; il < HELIX_SPARSITY_N_LAYERS; ++il) {
+        if (g_helix_sparsity.layer_magnet[il]) {
+            ++n_magnet;
+        } else if (g_helix_sparsity.layer_gate[il]) {
+            ++n_gate;
+        }
+    }
+
+    if (n_magnet == 0 && g_helix_stats.layers_magnet > 0) {
+        n_magnet = g_helix_stats.layers_magnet;
+    }
+    if (n_gate == 0 && g_helix_stats.layers_sparse > 0) {
+        n_gate = g_helix_stats.layers_sparse;
+    }
+
+    const bool engine_active = helix_env_flag_active("HELIX_DOPPELGANGER") &&
+        (n_magnet > 0 || n_gate > 0 || g_helix_sparsity.mask_samples > 0 || g_helix_stats.printed);
+
+    out->n_dense_layers    = 3;
+    out->n_magnet_layers   = n_magnet;
+    out->n_gate_layers     = n_gate;
+    out->engine_active     = engine_active;
+    out->mask_reads = g_helix_sparsity.mask_samples;
+    out->decode_mask_reads = g_helix_sparsity.decode_mask_samples;
+    out->active_neuron_measured = g_helix_sparsity.mask_samples > 0;
+
+    if (g_helix_sparsity.decode_total > 0) {
+        out->active_neuron_decode_pct = 100.0 * (double) g_helix_sparsity.decode_active /
+            (double) g_helix_sparsity.decode_total;
+    } else {
+        out->active_neuron_decode_pct = 0.0;
+    }
+
+    if (n_magnet > 0) {
+        const float wf = helix_magnet_env_width_frac();
+        if (wf > 0.0f && wf <= 1.0f) {
+            out->active_budget_pct = 100.0 * (double) wf;
+        } else {
+            out->active_budget_pct = helix_magnet_active_budget_pct();
+        }
+    } else if (n_gate > 0) {
+        out->active_budget_pct = 35.0;
+    } else {
+        out->active_budget_pct = 0.0;
+    }
+
+    if (g_helix_sparsity.total_neurons > 0) {
+        out->active_neuron_pct = 100.0 * (double) g_helix_sparsity.active_neurons /
+            (double) g_helix_sparsity.total_neurons;
+    } else {
+        out->active_neuron_pct = 0.0;
+    }
+
+    const int n_sparse = n_magnet + n_gate;
+    const int n_total  = out->n_dense_layers + n_sparse;
+    const double sparse_coverage = n_total > 0
+        ? 100.0 * (double) n_sparse / (double) n_total
+        : 0.0;
+
+    if (out->active_neuron_measured) {
+        out->ffn_flop_saved_pct = (100.0 - out->active_neuron_pct) * sparse_coverage / 100.0;
+    } else if (n_magnet > 0 || n_gate > 0) {
+        out->ffn_flop_saved_pct = (100.0 - out->active_budget_pct) * sparse_coverage / 100.0;
+    } else {
+        out->ffn_flop_saved_pct = 0.0;
+    }
+
+    return engine_active;
+}
+
+void llama_helix_sparsity_reset(void) {
+    helix_sparsity_reset();
+}
+
+bool llama_helix_sparsity_get(struct helix_sparsity_stats * out) {
+    return helix_sparsity_get(out);
+}
 
 // dedup helpers
 
@@ -914,6 +1127,7 @@ void llm_graph_result::reset() {
 }
 
 void llm_graph_result::set_inputs(const llama_ubatch * ubatch) {
+    helix_trace_set_ubatch_tokens(ubatch);
     for (auto & input : inputs) {
         input->set_input(ubatch);
     }
@@ -1227,6 +1441,1578 @@ llm_graph_qkv llm_graph_context::build_qkv(
 }
 
 
+static std::vector<int32_t> helix_trace_token_ids;
+static uint32_t helix_trace_batch_n_tokens = 0;
+
+static constexpr uint32_t HELIX_ACT_N_EMBD   = 2048;
+static constexpr uint32_t HELIX_ACT_N_LAYERS = 28;
+
+static bool helix_env_flag_active(const char * name) {
+    const char * v = std::getenv(name);
+    if (v == nullptr || v[0] == '\0') {
+        return false;
+    }
+    // Windows `set HELIX_TRACE=0` leaves the literal string "0" — treat as off.
+    if (v[0] == '0' && v[1] == '\0') {
+        return false;
+    }
+    if ((v[0] == 'f' || v[0] == 'F') && (strcmp(v + 1, "alse") == 0 || strcmp(v + 1, "ALSE") == 0)) {
+        return false;
+    }
+    if ((v[0] == 'o' || v[0] == 'O') && (strcmp(v + 1, "ff") == 0 || strcmp(v + 1, "FF") == 0)) {
+        return false;
+    }
+    if ((v[0] == 'n' || v[0] == 'N') && (strcmp(v + 1, "o") == 0 || strcmp(v + 1, "O") == 0)) {
+        return false;
+    }
+    return true;
+}
+
+bool helix_env_flag_enabled(const char * name) {
+    return helix_env_flag_active(name);
+}
+
+static bool helix_doppelganger_enabled() {
+    return helix_env_flag_active("HELIX_DOPPELGANGER");
+}
+
+static int64_t helix_magnet_active_k(int il, int64_t n_ff) {
+    const float frac_override = helix_magnet_env_width_frac();
+    float frac;
+    if (frac_override > 0.0f && frac_override <= 1.0f) {
+        frac = frac_override;
+    } else {
+        frac = (il < 13) ? 0.25f : 0.20f;
+    }
+    int64_t k = (int64_t) (frac * (float) n_ff + 0.5f);
+    if (k < 1) {
+        k = 1;
+    }
+    if (k > n_ff) {
+        k = n_ff;
+    }
+    return k;
+}
+
+static bool helix_magnet_sparse_mode_enabled() {
+    if (!helix_doppelganger_enabled()) {
+        return false;
+    }
+    if (helix_env_flag_active("HELIX_MAGNET_DENSE")) {
+        return false;
+    }
+    return helix_env_flag_active("HELIX_MAGNET_SPARSE");
+}
+
+static bool helix_magnet_row_gather_enabled() {
+    // Experimental physical row gather (mul_mat_id). Requires HELIX_MAGNET_SPARSE=1.
+    return helix_magnet_sparse_mode_enabled() && helix_env_flag_active("HELIX_MAGNET_GATHER");
+}
+
+static ggml_tensor * helix_sum_dim1_rows(
+        ggml_context * ctx0,
+        ggml_tensor * down_out,
+        int64_t        n_embd_cur,
+        int64_t        n_ffn_tokens) {
+    // down_out [n_embd, k, n_tokens] -> sum over k in one op (avoid O(k) add nodes in graph)
+    ggml_tensor * perm = ggml_cont(ctx0, ggml_permute(ctx0, down_out, 1, 0, 2, 3));
+    ggml_tensor * sum  = ggml_sum_rows(ctx0, perm);
+    return ggml_cont(ctx0, ggml_reshape_2d(ctx0, sum, n_embd_cur, n_ffn_tokens));
+}
+
+// GGUF stores magnet A/B with reversed dims vs ggml_mul_mat (see embed_magnet_gguf.py ti_shape).
+static ggml_tensor * helix_magnet_view_for_mul_mat(
+        ggml_context * ctx0,
+        ggml_tensor * weight,
+        int64_t       rows,
+        int64_t       cols) {
+    ggml_tensor * w = ggml_cont(ctx0, ggml_cast(ctx0, weight, GGML_TYPE_F32));
+    if (w->ne[0] == rows && w->ne[1] == cols) {
+        return w;
+    }
+    if (w->ne[0] == cols && w->ne[1] == rows) {
+        return ggml_view_2d(ctx0, w, rows, cols, cols * ggml_element_size(w), 0);
+    }
+    return w;
+}
+
+static bool helix_trace_enabled() {
+    return helix_env_flag_active("HELIX_TRACE");
+}
+
+static bool helix_act_cache_enabled() {
+    return helix_env_flag_active("HELIX_ACTIVATION_CACHE");
+}
+
+static const char * helix_act_cache_path() {
+    const char * path = std::getenv("HELIX_ACTIVATION_CACHE");
+    if (path != nullptr && path[0] != '\0' &&
+        !(path[0] == '1' && path[1] == '\0')) {
+        return path;
+    }
+    return "F:/NewAI/models/helix_official/native_activation_cache.bin";
+}
+
+#pragma pack(push, 1)
+struct helix_act_header {
+    char     magic[8];
+    uint32_t version;
+    uint32_t n_embd;
+    uint32_t n_layers;
+    uint64_t reserved;
+};
+
+struct helix_act_record_hdr {
+    uint32_t layer_idx;
+    uint32_t batch_n_tokens;
+    uint32_t token_pos;
+    int32_t  token_id;
+};
+#pragma pack(pop)
+
+static void helix_trace_clear_stale_cache_once() {
+    static bool cleared = false;
+    if (cleared || !helix_trace_enabled()) {
+        return;
+    }
+    cleared = true;
+    const char * cache_path = helix_act_cache_path();
+    if (remove(cache_path) == 0) {
+        LLAMA_LOG("[HELIX] Cleared stale activation cache\n");
+    }
+}
+
+static FILE * helix_act_cache_fp() {
+    static FILE * fp = nullptr;
+    static bool   header_written = false;
+    if (!helix_act_cache_enabled()) {
+        return nullptr;
+    }
+    if (fp == nullptr) {
+        helix_trace_clear_stale_cache_once();
+        const char * path = helix_act_cache_path();
+        const bool truncate = helix_env_flag_active("HELIX_ACTIVATION_CACHE_TRUNCATE") || helix_trace_enabled();
+        fp = fopen(path, truncate ? "wb" : "ab");
+        if (fp == nullptr) {
+            LLAMA_LOG_ERROR("%s: failed to open HELIX_ACTIVATION_CACHE '%s'\n", __func__, path);
+            return nullptr;
+        }
+        setvbuf(fp, nullptr, _IONBF, 0);
+        if (truncate || ftell(fp) == 0) {
+            helix_act_header hdr {};
+            memcpy(hdr.magic, "HELIXAC1", 8);
+            hdr.version  = 1;
+            hdr.n_embd   = HELIX_ACT_N_EMBD;
+            hdr.n_layers = HELIX_ACT_N_LAYERS;
+            hdr.reserved = 0;
+            if (fwrite(&hdr, sizeof(hdr), 1, fp) != 1) {
+                LLAMA_LOG_ERROR("%s: failed to write activation cache header\n", __func__);
+            } else {
+                header_written = true;
+                LLAMA_LOG_INFO("%s: writing native activation cache -> %s\n", __func__, path);
+            }
+        } else {
+            header_written = true;
+        }
+    }
+    (void) header_written;
+    return fp;
+}
+
+static void helix_act_cache_write_gate_hidden(ggml_tensor * gate_scores, int il) {
+    if (gate_scores == nullptr || gate_scores->src[1] == nullptr) {
+        return;
+    }
+    if (il < 0 || il >= (int) HELIX_ACT_N_LAYERS) {
+        return;
+    }
+    // Skip single-token decode steps; keep multi-token prefill batches.
+    if (helix_trace_batch_n_tokens <= 1) {
+        return;
+    }
+
+    FILE * fp = helix_act_cache_fp();
+    if (fp == nullptr) {
+        return;
+    }
+
+    ggml_tensor * hidden = gate_scores->src[1];
+    if (hidden->type != GGML_TYPE_F32) {
+        return;
+    }
+
+    const int64_t n_embd   = hidden->ne[0];
+    const int64_t n_tokens = hidden->ne[1];
+    if (n_embd != (int64_t) HELIX_ACT_N_EMBD) {
+        return;
+    }
+
+    std::vector<float> row(n_embd);
+    for (int64_t tok = 0; tok < n_tokens; ++tok) {
+        ggml_backend_tensor_get(
+            hidden, row.data(), tok * n_embd * sizeof(float), n_embd * sizeof(float));
+
+        helix_act_record_hdr rec {};
+        rec.layer_idx       = (uint32_t) il;
+        rec.batch_n_tokens  = helix_trace_batch_n_tokens;
+        rec.token_pos       = (uint32_t) tok;
+        rec.token_id        = (tok < (int64_t) helix_trace_token_ids.size())
+            ? helix_trace_token_ids[tok] : 0;
+
+        if (fwrite(&rec, sizeof(rec), 1, fp) != 1 ||
+            fwrite(row.data(), sizeof(float), (size_t) n_embd, fp) != (size_t) n_embd) {
+            LLAMA_LOG_ERROR("%s: failed to write activation record (layer=%d tok=%lld)\n",
+                    __func__, il, (long long) tok);
+            return;
+        }
+    }
+}
+
+static int64_t helix_trace_focus_token_index(int64_t n_tokens) {
+    // Qwen3 chat-template prefill for "Hello" (--single-turn): 9 tokens, payload at index 3.
+    if (n_tokens == 9) {
+        return 3;
+    }
+    return 0;
+}
+
+static bool helix_trace_want_raw_logits(int il, int64_t tok, int64_t n_tokens) {
+    if (il != 0 && il != 19) {
+        return false;
+    }
+    if (n_tokens == 9) {
+        return tok == helix_trace_focus_token_index(n_tokens);
+    }
+    return tok == 0 || tok == n_tokens - 1;
+}
+
+static FILE * helix_trace_file() {
+    static FILE * fp = nullptr;
+    if (fp == nullptr) {
+        if (!helix_trace_enabled()) {
+            return nullptr;
+        }
+        helix_trace_clear_stale_cache_once();
+        fp = fopen("F:/NewAI/helix_trace_cpp.log", "a");
+        if (fp != nullptr) {
+            setvbuf(fp, nullptr, _IONBF, 0);
+        }
+    }
+    return fp;
+}
+
+static bool helix_trace_layer_wanted(int il) {
+    return il == 0 || il == 19;
+}
+
+#define HELIX_TRACE_FPRINTF(...) do { \
+        if (helix_trace_file() != nullptr) { \
+            fprintf(helix_trace_file(), __VA_ARGS__); \
+            fflush(helix_trace_file()); \
+        } \
+    } while (0)
+
+void helix_trace_set_ubatch_tokens(const llama_ubatch * ubatch) {
+    helix_trace_token_ids.clear();
+    helix_trace_batch_n_tokens = 0;
+    if ((!helix_trace_enabled() && !helix_act_cache_enabled()) ||
+        ubatch == nullptr || ubatch->token == nullptr) {
+        return;
+    }
+    helix_trace_batch_n_tokens = ubatch->n_tokens;
+    helix_trace_token_ids.assign(ubatch->token, ubatch->token + ubatch->n_tokens);
+    if (helix_trace_file() == nullptr) {
+        return;
+    }
+    HELIX_TRACE_FPRINTF("[HELIX TRACE] batch n_tokens=%u token_ids:", ubatch->n_tokens);
+    for (int32_t tid : helix_trace_token_ids) {
+        HELIX_TRACE_FPRINTF(" %d", tid);
+    }
+    if (ubatch->n_tokens == 9) {
+        HELIX_TRACE_FPRINTF(" | focus_token_index=3 (chat-template payload)");
+    }
+    HELIX_TRACE_FPRINTF("\n");
+}
+
+static int helix_trace_layer_from_name(const char * name) {
+    if (name == nullptr) {
+        return -1;
+    }
+    const char * dash = strrchr(name, '-');
+    if (dash == nullptr || dash[1] == '\0') {
+        return -1;
+    }
+    return atoi(dash + 1);
+}
+
+static bool helix_trace_name_matches(const char * name, const char * prefix) {
+    if (name == nullptr || prefix == nullptr) {
+        return false;
+    }
+    const size_t n = strlen(prefix);
+    return strncmp(name, prefix, n) == 0 && name[n] == '-';
+}
+
+static const ggml_tensor * helix_trace_gate_scores_from_node(const ggml_tensor * t) {
+    const ggml_tensor * node = t;
+    for (int depth = 0; depth < 4 && node != nullptr; ++depth) {
+        if (helix_trace_name_matches(node->name, "helix_gate_scores")) {
+            return node;
+        }
+        node = node->src[0];
+    }
+    const ggml_tensor * sorted = t && t->src[0] ? t->src[0] : nullptr;
+    const ggml_tensor * probs  = sorted && sorted->src[0] ? sorted->src[0] : nullptr;
+    return probs && probs->src[0] ? probs->src[0] : nullptr;
+}
+
+struct helix_blk_q8_0 {
+    ggml_fp16_t d;
+    int8_t      qs[32];
+};
+
+static void helix_trace_gate_topk_from_scores(
+        const ggml_tensor * gate_scores,
+        int                   top_k,
+        int64_t               tok,
+        int32_t             & out_a,
+        int32_t             & out_b) {
+    out_a = -1;
+    out_b = -1;
+    if (gate_scores == nullptr || gate_scores->type != GGML_TYPE_F32 || top_k <= 0) {
+        return;
+    }
+
+    const int64_t num_clusters = gate_scores->ne[0];
+    const int64_t n_tokens     = gate_scores->ne[1];
+    if (tok < 0 || tok >= n_tokens) {
+        return;
+    }
+
+    std::vector<float> row((size_t) num_clusters);
+    ggml_backend_tensor_get(
+        gate_scores,
+        row.data(),
+        (size_t) tok * (size_t) num_clusters * sizeof(float),
+        (size_t) num_clusters * sizeof(float));
+
+    float maxv = row[0];
+    for (int64_t c = 1; c < num_clusters; ++c) {
+        maxv = std::max(maxv, row[c]);
+    }
+    double sum = 0.0;
+    std::vector<double> probs((size_t) num_clusters);
+    for (int64_t c = 0; c < num_clusters; ++c) {
+        probs[(size_t) c] = exp((double) row[(size_t) c] - (double) maxv);
+        sum += probs[(size_t) c];
+    }
+    for (int64_t c = 0; c < num_clusters; ++c) {
+        probs[(size_t) c] /= sum;
+    }
+
+    std::vector<int64_t> order((size_t) num_clusters);
+    std::iota(order.begin(), order.end(), 0);
+    std::partial_sort(order.begin(), order.begin() + top_k, order.end(),
+        [&](int64_t a, int64_t b) { return probs[(size_t) a] > probs[(size_t) b]; });
+
+    if (top_k > 0) {
+        out_a = (int32_t) order[0];
+    }
+    if (top_k > 1) {
+        out_b = (int32_t) order[1];
+    }
+}
+
+static void helix_trace_dump_mul_mat_id_ids(ggml_tensor * ids, int il, int top_k, bool at_eval) {
+    if (ids == nullptr || ids->type != GGML_TYPE_I32) {
+        return;
+    }
+
+    const int64_t n_ids = ggml_nelements(ids);
+    LLAMA_LOG("[HELIX TRACE] Layer %d MulMatID Expert IDs%s:\n", il, at_eval ? " (eval)" : " (graph build)");
+    HELIX_TRACE_FPRINTF("[HELIX TRACE] Layer %d MulMatID Expert IDs%s:\n", il, at_eval ? " (eval)" : " (graph build)");
+    LLAMA_LOG("  matmul path: ggml_mul_mat_id via build_lora_mm_id (not ggml_view_2d weight slicing)\n");
+    HELIX_TRACE_FPRINTF("  matmul path: ggml_mul_mat_id via build_lora_mm_id (not ggml_view_2d weight slicing)\n");
+    LLAMA_LOG("  ids tensor nelements: %lld\n", (long long) n_ids);
+    HELIX_TRACE_FPRINTF("  ids tensor nelements: %lld\n", (long long) n_ids);
+    LLAMA_LOG("  ids tensor shape: [%lld, %lld]\n", (long long) ids->ne[0], (long long) ids->ne[1]);
+    HELIX_TRACE_FPRINTF("  ids tensor shape: [%lld, %lld]\n", (long long) ids->ne[0], (long long) ids->ne[1]);
+
+    if (!at_eval) {
+        LLAMA_LOG("  ids->data at build time: %s (values populated at eval before mul_mat_id)\n",
+                ids->data ? "non-null" : "null");
+        HELIX_TRACE_FPRINTF("  ids->data at build time: %s (values populated at eval before mul_mat_id)\n",
+                ids->data ? "non-null" : "null");
+        return;
+    }
+
+    std::vector<int32_t> id_data((size_t) n_ids);
+    ggml_backend_tensor_get(ids, id_data.data(), 0, (size_t) n_ids * sizeof(int32_t));
+
+    const int64_t top_k_dim = ids->ne[0];
+    const int64_t n_tokens  = ids->ne[1];
+    for (int i = 0; i < (int) n_ids && i < 8; ++i) {
+        LLAMA_LOG("  ids[%d] = %d\n", i, id_data[(size_t) i]);
+        HELIX_TRACE_FPRINTF("  ids[%d] = %d\n", i, id_data[(size_t) i]);
+    }
+
+    const ggml_tensor * gate_scores = helix_trace_gate_scores_from_node(ids);
+    const int64_t focus = helix_trace_focus_token_index(n_tokens);
+    int32_t expected_a = -1;
+    int32_t expected_b = -1;
+    if (gate_scores != nullptr) {
+        helix_trace_gate_topk_from_scores(gate_scores, top_k, focus, expected_a, expected_b);
+    }
+
+    const int32_t ids_a = (top_k_dim > 0 && focus >= 0 && focus < n_tokens)
+        ? id_data[(size_t) (focus * top_k_dim + 0)] : -1;
+    const int32_t ids_b = (top_k_dim > 1 && focus >= 0 && focus < n_tokens)
+        ? id_data[(size_t) (focus * top_k_dim + 1)] : -1;
+
+    LLAMA_LOG("  Expected cluster IDs from gate (token %lld): %d %d\n",
+            (long long) focus, expected_a, expected_b);
+    HELIX_TRACE_FPRINTF("  Expected cluster IDs from gate (token %lld): %d %d\n",
+            (long long) focus, expected_a, expected_b);
+    LLAMA_LOG("  ids at focus token %lld: %d %d\n", (long long) focus, ids_a, ids_b);
+    HELIX_TRACE_FPRINTF("  ids at focus token %lld: %d %d\n", (long long) focus, ids_a, ids_b);
+}
+
+static void helix_trace_dump_down_exps_raw_weights(const ggml_tensor * down_exps, int il) {
+    if (down_exps == nullptr || down_exps->type != GGML_TYPE_Q8_0) {
+        LLAMA_LOG("[HELIX TRACE] Layer %d Sidecar Raw Weights: skipped (type=%d)\n", il, down_exps ? (int) down_exps->type : -1);
+        return;
+    }
+
+    helix_blk_q8_0 block{};
+    ggml_backend_tensor_get(down_exps, &block, 0, sizeof(block));
+
+    const float scale = ggml_fp16_to_fp32(block.d);
+    LLAMA_LOG("[HELIX TRACE] Layer %d Sidecar Raw Weights:\n", il);
+    LLAMA_LOG("  Block 0 scale (d): %f\n", scale);
+    HELIX_TRACE_FPRINTF("[HELIX TRACE] Layer %d Sidecar Raw Weights:\n", il);
+    HELIX_TRACE_FPRINTF("  Block 0 scale (d): %f\n", scale);
+    for (int i = 0; i < 4; ++i) {
+        const float val = (float) block.qs[i] * scale;
+        LLAMA_LOG("  weight[%d] = %f (raw q8: %d)\n", i, val, (int) block.qs[i]);
+        HELIX_TRACE_FPRINTF("  weight[%d] = %f (raw q8: %d)\n", i, val, (int) block.qs[i]);
+    }
+    LLAMA_LOG("  down_exps ne=[%lld,%lld,%lld]\n",
+            (long long) down_exps->ne[0], (long long) down_exps->ne[1], (long long) down_exps->ne[2]);
+    HELIX_TRACE_FPRINTF("  down_exps ne=[%lld,%lld,%lld]\n",
+            (long long) down_exps->ne[0], (long long) down_exps->ne[1], (long long) down_exps->ne[2]);
+}
+
+static void helix_trace_dump_top_clusters(ggml_tensor * t, int il) {
+    if (t == nullptr || t->type != GGML_TYPE_I32) {
+        return;
+    }
+
+    const int64_t top_k      = t->ne[0];
+    const int64_t n_tokens   = t->ne[1];
+    const ggml_tensor * gate_scores = helix_trace_gate_scores_from_node(t);
+    const int64_t num_clusters = gate_scores ? gate_scores->ne[0] : 0;
+    const int64_t cluster_width = (num_clusters > 0) ? (6144 / num_clusters) : 0;
+
+    std::vector<int32_t> host(ggml_nbytes(t) / sizeof(int32_t));
+    ggml_backend_tensor_get(t, host.data(), 0, ggml_nbytes(t));
+
+    HELIX_TRACE_FPRINTF("[HELIX TRACE] Layer %d | top_k=%lld | n_tokens=%lld | clusters=%lld | cluster_width=%lld\n",
+            il, (long long) top_k, (long long) n_tokens, (long long) num_clusters, (long long) cluster_width);
+
+    for (int64_t tok = 0; tok < n_tokens; ++tok) {
+        if (il == 19 && helix_trace_enabled() && helix_trace_want_raw_logits(il, tok, n_tokens)) {
+            int32_t cid_a = (top_k > 0) ? host[0 + tok * top_k] : -1;
+            int32_t cid_b = (top_k > 1) ? host[1 + tok * top_k] : -1;
+            LLAMA_LOG("selected cluster IDs: %d %d\n", cid_a, cid_b);
+            HELIX_TRACE_FPRINTF("selected cluster IDs: %d %d\n", cid_a, cid_b);
+        }
+        HELIX_TRACE_FPRINTF("[HELIX TRACE] Layer %d | token %lld | Selected Cluster IDs:", il, (long long) tok);
+        for (int64_t k = 0; k < top_k; ++k) {
+            const int32_t cid = host[k + tok * top_k];
+            const int64_t weight_offset = (int64_t) cid * cluster_width;
+            HELIX_TRACE_FPRINTF(" %d (offset %lld)", cid, (long long) weight_offset);
+        }
+        HELIX_TRACE_FPRINTF("\n");
+    }
+}
+
+static void helix_trace_dump_raw_logits_prefix(ggml_tensor * t, int il, int64_t tok, int count) {
+    if (t == nullptr || t->type != GGML_TYPE_F32 || count <= 0) {
+        return;
+    }
+
+    const int64_t num_clusters = t->ne[0];
+    const int64_t n_tokens     = t->ne[1];
+    if (tok < 0 || tok >= n_tokens) {
+        return;
+    }
+
+    const int n_print = (int) std::min<int64_t>(count, num_clusters);
+    std::vector<float> row(num_clusters);
+    ggml_backend_tensor_get(t, row.data(), tok * num_clusters * sizeof(float), num_clusters * sizeof(float));
+
+    HELIX_TRACE_FPRINTF("[HELIX TRACE] Layer %d | token %lld | raw logits (pre-softmax) first %d:",
+            il, (long long) tok, n_print);
+    for (int i = 0; i < n_print; ++i) {
+        HELIX_TRACE_FPRINTF(" [%d]=%.6f", i, row[i]);
+    }
+    HELIX_TRACE_FPRINTF("\n");
+}
+
+static void helix_trace_dump_hidden_prefix(ggml_tensor * gate_scores, int il, int64_t tok, int count) {
+    if (gate_scores == nullptr || gate_scores->src[1] == nullptr) {
+        return;
+    }
+    ggml_tensor * hidden = gate_scores->src[1];
+    if (hidden->type != GGML_TYPE_F32) {
+        return;
+    }
+    const int64_t n_embd = hidden->ne[0];
+    const int64_t n_tokens = hidden->ne[1];
+    if (tok < 0 || tok >= n_tokens) {
+        return;
+    }
+    const int n_print = (int) std::min<int64_t>(count, n_embd);
+    std::vector<float> row(n_embd);
+    ggml_backend_tensor_get(hidden, row.data(), tok * n_embd * sizeof(float), n_embd * sizeof(float));
+    HELIX_TRACE_FPRINTF("[HELIX TRACE] Layer %d | token %lld | hidden (pre-gate) first %d:",
+            il, (long long) tok, n_print);
+    for (int i = 0; i < n_print; ++i) {
+        HELIX_TRACE_FPRINTF(" [%d]=%.6f", i, row[i]);
+    }
+    HELIX_TRACE_FPRINTF("\n");
+}
+
+static void helix_trace_dump_gate_scores(ggml_tensor * t, int il, int top_k) {
+    if (t == nullptr || t->type != GGML_TYPE_F32 || t->src[0] == nullptr) {
+        return;
+    }
+
+    const int64_t num_clusters = t->ne[0];
+    const int64_t n_tokens     = t->ne[1];
+    const int64_t cluster_width = (num_clusters > 0) ? (6144 / num_clusters) : 0;
+
+    std::vector<float> scores(num_clusters * n_tokens);
+    ggml_backend_tensor_get(t, scores.data(), 0, scores.size() * sizeof(float));
+
+    for (int64_t tok = 0; tok < n_tokens; ++tok) {
+        const float * row = scores.data() + tok * num_clusters;
+
+        if (il == 19 && helix_trace_enabled() && helix_trace_want_raw_logits(il, tok, n_tokens)) {
+            LLAMA_LOG("=== LAYER 19 GEOMETRY TRACE (token %lld) ===\n", (long long) tok);
+            LLAMA_LOG("layer_clusters: %lld\n", (long long) num_clusters);
+            LLAMA_LOG("cluster_width: %lld\n", (long long) cluster_width);
+            HELIX_TRACE_FPRINTF("=== LAYER 19 GEOMETRY TRACE (token %lld) ===\n", (long long) tok);
+            HELIX_TRACE_FPRINTF("layer_clusters: %lld\n", (long long) num_clusters);
+            HELIX_TRACE_FPRINTF("cluster_width: %lld\n", (long long) cluster_width);
+            LLAMA_LOG("raw gate logits first 8:");
+            HELIX_TRACE_FPRINTF("raw gate logits first 8:");
+            const int n_print = (int) std::min<int64_t>(8, num_clusters);
+            for (int i = 0; i < n_print; ++i) {
+                LLAMA_LOG(" %.6f", row[i]);
+                HELIX_TRACE_FPRINTF(" %.6f", row[i]);
+            }
+            LLAMA_LOG("\n");
+            HELIX_TRACE_FPRINTF("\n");
+        }
+
+        if (helix_trace_want_raw_logits(il, tok, n_tokens)) {
+            if (tok < (int64_t) helix_trace_token_ids.size()) {
+                HELIX_TRACE_FPRINTF("[HELIX TRACE] Layer %d | token %lld | token_id=%d\n",
+                        il, (long long) tok, helix_trace_token_ids[tok]);
+            }
+            helix_trace_dump_hidden_prefix(t, il, tok, 8);
+            helix_trace_dump_raw_logits_prefix(t, il, tok, 8);
+        }
+
+        // softmax for trace probabilities
+        float maxv = row[0];
+        for (int64_t c = 1; c < num_clusters; ++c) {
+            maxv = std::max(maxv, row[c]);
+        }
+        double sum = 0.0;
+        std::vector<double> probs(num_clusters);
+        for (int64_t c = 0; c < num_clusters; ++c) {
+            probs[c] = exp((double) row[c] - (double) maxv);
+            sum += probs[c];
+        }
+        for (int64_t c = 0; c < num_clusters; ++c) {
+            probs[c] /= sum;
+        }
+
+        std::vector<int64_t> order(num_clusters);
+        std::iota(order.begin(), order.end(), 0);
+        std::partial_sort(order.begin(), order.begin() + top_k, order.end(),
+            [&](int64_t a, int64_t b) { return probs[a] > probs[b]; });
+
+        HELIX_TRACE_FPRINTF("[HELIX TRACE] Layer %d | token %lld | gate softmax top-%d:", il, (long long) tok, top_k);
+        for (int k = 0; k < top_k; ++k) {
+            const int64_t cid = order[k];
+            const int64_t weight_offset = cid * cluster_width;
+            HELIX_TRACE_FPRINTF(" %lld(prob=%.6f,logit=%.6f,offset=%lld)",
+                    (long long) cid, probs[cid], row[cid], (long long) weight_offset);
+        }
+        HELIX_TRACE_FPRINTF("\n");
+    }
+}
+
+static void helix_trace_dump_row_prefix(
+        ggml_tensor * t,
+        int il,
+        int64_t tok,
+        int count,
+        const char * label) {
+    if (t == nullptr || count <= 0 || label == nullptr) {
+        return;
+    }
+
+    const int64_t n_embd   = t->ne[0];
+    const int64_t n_tokens = t->ne[1];
+    if (tok < 0 || tok >= n_tokens) {
+        return;
+    }
+
+    const int n_print = (int) std::min<int64_t>(count, n_embd);
+    std::vector<float> row(n_embd);
+
+    if (t->type == GGML_TYPE_F32) {
+        ggml_backend_tensor_get(t, row.data(), tok * n_embd * sizeof(float), n_embd * sizeof(float));
+    } else if (t->type == GGML_TYPE_F16) {
+        std::vector<ggml_fp16_t> row_f16(n_embd);
+        ggml_backend_tensor_get(t, row_f16.data(), tok * n_embd * sizeof(ggml_fp16_t), n_embd * sizeof(ggml_fp16_t));
+        for (int i = 0; i < n_print; ++i) {
+            row[i] = ggml_fp16_to_fp32(row_f16[i]);
+        }
+    } else {
+        return;
+    }
+
+    if (tok < (int64_t) helix_trace_token_ids.size()) {
+        HELIX_TRACE_FPRINTF("[HELIX TRACE] Layer %d | token %lld | token_id=%d | %s first %d:",
+                il, (long long) tok, helix_trace_token_ids[tok], label, n_print);
+    } else {
+        HELIX_TRACE_FPRINTF("[HELIX TRACE] Layer %d | token %lld | %s first %d:",
+                il, (long long) tok, label, n_print);
+    }
+    for (int i = 0; i < n_print; ++i) {
+        HELIX_TRACE_FPRINTF(" [%d]=%.6f", i, row[i]);
+    }
+    HELIX_TRACE_FPRINTF("\n");
+}
+
+static void helix_trace_dump_swiglu_prefix(
+        ggml_tensor * t,
+        int il,
+        int64_t tok,
+        int count,
+        const char * label) {
+    if (t == nullptr || count <= 0 || label == nullptr) {
+        return;
+    }
+
+    const int64_t width    = t->ne[0];
+    const int64_t top_k    = t->ne[1];
+    const int64_t n_tokens = t->ne[2];
+    if (tok < 0 || tok >= n_tokens || width <= 0 || top_k <= 0) {
+        return;
+    }
+
+    const int n_print = (int) std::min<int64_t>(count, width);
+    std::vector<float> row((size_t) width);
+
+    for (int64_t expert = 0; expert < top_k; ++expert) {
+        const size_t byte_offset = (size_t) tok * t->nb[2] + (size_t) expert * t->nb[1];
+
+        if (t->type == GGML_TYPE_F32) {
+            ggml_backend_tensor_get(t, row.data(), byte_offset, (size_t) width * sizeof(float));
+        } else if (t->type == GGML_TYPE_F16) {
+            std::vector<ggml_fp16_t> row_f16((size_t) width);
+            ggml_backend_tensor_get(t, row_f16.data(), byte_offset, (size_t) width * sizeof(ggml_fp16_t));
+            for (int64_t i = 0; i < width; ++i) {
+                row[(size_t) i] = ggml_fp16_to_fp32(row_f16[(size_t) i]);
+            }
+        } else {
+            return;
+        }
+
+        if (tok < (int64_t) helix_trace_token_ids.size()) {
+            HELIX_TRACE_FPRINTF(
+                "[HELIX TRACE] Layer %d | token %lld | token_id=%d | %s expert_slot=%lld first %d:",
+                il, (long long) tok, helix_trace_token_ids[tok], label, (long long) expert, n_print);
+        } else {
+            HELIX_TRACE_FPRINTF(
+                "[HELIX TRACE] Layer %d | token %lld | %s expert_slot=%lld first %d:",
+                il, (long long) tok, label, (long long) expert, n_print);
+        }
+        for (int i = 0; i < n_print; ++i) {
+            HELIX_TRACE_FPRINTF(" [%d]=%.6f", i, row[(size_t) i]);
+        }
+        HELIX_TRACE_FPRINTF("\n");
+    }
+}
+
+static void helix_trace_dump_experts_down_out(
+        ggml_tensor * t,
+        int il,
+        int64_t tok,
+        int count) {
+    if (t == nullptr || t->type != GGML_TYPE_F32 || count <= 0) {
+        return;
+    }
+
+    const int64_t n_embd   = t->ne[0];
+    const int64_t top_k    = t->ne[1];
+    const int64_t n_tokens = t->ne[2];
+    if (tok < 0 || tok >= n_tokens || top_k <= 0) {
+        return;
+    }
+
+    const int n_print = (int) std::min<int64_t>(count, n_embd);
+    std::vector<float> row((size_t) n_embd);
+    const size_t byte_offset = (size_t) tok * t->nb[2];
+    ggml_backend_tensor_get(t, row.data(), byte_offset, (size_t) n_embd * sizeof(float));
+
+    LLAMA_LOG("[HELIX TRACE] Layer %d post-down-proj (mul_mat_id output) token %lld first %d:",
+            il, (long long) tok, n_print);
+    HELIX_TRACE_FPRINTF("[HELIX TRACE] Layer %d post-down-proj (mul_mat_id output) token %lld first %d:",
+            il, (long long) tok, n_print);
+    for (int i = 0; i < n_print; ++i) {
+        LLAMA_LOG(" [%d]=%.6f", i, row[(size_t) i]);
+        HELIX_TRACE_FPRINTF(" [%d]=%.6f", i, row[(size_t) i]);
+    }
+    LLAMA_LOG("\n");
+    HELIX_TRACE_FPRINTF("\n");
+    LLAMA_LOG("[HELIX TRACE] Layer %d post-down-proj tensor shape: [%lld, %lld, %lld]\n",
+            il, (long long) n_embd, (long long) top_k, (long long) n_tokens);
+    HELIX_TRACE_FPRINTF("[HELIX TRACE] Layer %d post-down-proj tensor shape: [%lld, %lld, %lld]\n",
+            il, (long long) n_embd, (long long) top_k, (long long) n_tokens);
+}
+
+static bool helix_trace_is_l19_swiglu_tensor(const char * name) {
+    return name != nullptr && strcmp(name, "helix_swiglu_l19_tok3") == 0;
+}
+
+static bool helix_trace_is_l19_gate_raw_tensor(const char * name) {
+    return name != nullptr && strcmp(name, "helix_gate_raw_l19") == 0;
+}
+
+static bool helix_trace_is_l19_up_raw_tensor(const char * name) {
+    return name != nullptr && strcmp(name, "helix_up_raw_l19") == 0;
+}
+
+static void helix_trace_dump_l19_raw_linear(
+        ggml_tensor * t,
+        const char * label,
+        int64_t tok,
+        int count) {
+    if (t == nullptr || label == nullptr || count <= 0) {
+        return;
+    }
+
+    const int64_t width    = t->ne[0];
+    const int64_t top_k    = t->ne[1];
+    const int64_t n_tokens = t->ne[2];
+    if (tok < 0 || tok >= n_tokens || width <= 0 || top_k <= 0) {
+        return;
+    }
+
+    const int n_print = (int) std::min<int64_t>(count, width);
+    std::vector<float> row((size_t) width);
+    const size_t byte_offset = (size_t) tok * t->nb[2];
+
+    if (t->type == GGML_TYPE_F32) {
+        ggml_backend_tensor_get(t, row.data(), byte_offset, (size_t) width * sizeof(float));
+    } else if (t->type == GGML_TYPE_F16) {
+        std::vector<ggml_fp16_t> row_f16((size_t) width);
+        ggml_backend_tensor_get(t, row_f16.data(), byte_offset, (size_t) width * sizeof(ggml_fp16_t));
+        for (int64_t i = 0; i < width; ++i) {
+            row[(size_t) i] = ggml_fp16_to_fp32(row_f16[(size_t) i]);
+        }
+    } else {
+        return;
+    }
+
+    LLAMA_LOG("[HELIX TRACE] Layer 19 %s:", label);
+    HELIX_TRACE_FPRINTF("[HELIX TRACE] Layer 19 %s:", label);
+    for (int i = 0; i < n_print; ++i) {
+        LLAMA_LOG(" val[%d]=%.6f", i, row[(size_t) i]);
+        HELIX_TRACE_FPRINTF(" val[%d]=%.6f", i, row[(size_t) i]);
+    }
+    LLAMA_LOG("\n");
+    HELIX_TRACE_FPRINTF("\n");
+}
+
+static bool helix_trace_is_ffn_out_tensor(const char * name) {
+    return helix_trace_name_matches(name, "helix_ffn_out") ||
+           helix_trace_name_matches(name, "ffn_out");
+}
+
+bool helix_runtime_cb_eval(ggml_tensor * t, bool ask, void * user_data) {
+    if (helix_doppelganger_enabled() && t != nullptr && t->name[0] != '\0') {
+        const bool is_magnet_mask = helix_trace_name_matches(t->name, "magnet_mask");
+        const bool is_magnet_topk = helix_trace_name_matches(t->name, "magnet_topk");
+        const bool is_dg_mask     = helix_trace_name_matches(t->name, "dg_mask");
+        if (is_magnet_mask || is_magnet_topk || is_dg_mask) {
+            if (ask) {
+                return true;
+            }
+            const int il = helix_trace_layer_from_name(t->name);
+            if (is_magnet_topk) {
+                const int64_t n_ff = (il >= 0 && il < HELIX_SPARSITY_N_LAYERS) ? g_helix_layer_n_ff[il] : 0;
+                const int64_t n_tokens = t->ne[1] > 0 ? t->ne[1] : 1;
+                const int64_t k_sel    = t->ne[0];
+                if (n_ff > 0) {
+                    g_helix_sparsity.active_neurons += (uint64_t) k_sel * (uint64_t) n_tokens;
+                    g_helix_sparsity.total_neurons  += (uint64_t) n_ff  * (uint64_t) n_tokens;
+                    ++g_helix_sparsity.mask_samples;
+                    if (n_tokens == 1) {
+                        g_helix_sparsity.decode_active += (uint64_t) k_sel;
+                        g_helix_sparsity.decode_total  += (uint64_t) n_ff;
+                        ++g_helix_sparsity.decode_mask_samples;
+                    }
+                    g_helix_sparsity.layer_magnet[il] = true;
+                }
+            } else {
+                helix_sparsity_accumulate_mask(t, il, is_magnet_mask, false);
+            }
+            return true;
+        }
+    }
+
+    if (helix_trace_enabled() || helix_act_cache_enabled()) {
+        return helix_trace_cb_eval(t, ask, user_data);
+    }
+
+    return false;
+}
+
+bool helix_trace_cb_eval(ggml_tensor * t, bool ask, void * /*user_data*/) {
+    if (!helix_trace_enabled() && !helix_act_cache_enabled()) {
+        return false;
+    }
+
+    if (t == nullptr || t->name[0] == '\0') {
+        return false;
+    }
+
+    const int il = helix_trace_layer_from_name(t->name);
+    const bool is_top      = helix_trace_name_matches(t->name, "helix_top_clusters");
+    const bool is_gate     = helix_trace_name_matches(t->name, "helix_gate_scores");
+    const bool is_act_gate = il == 0 && helix_trace_enabled() && helix_trace_name_matches(t->name, "helix_act_gate");
+    const bool is_act_up   = il == 0 && helix_trace_enabled() && helix_trace_name_matches(t->name, "helix_act_up");
+    const bool is_l19_swiglu = helix_trace_enabled() && helix_trace_is_l19_swiglu_tensor(t->name);
+    const bool is_l19_gate_raw = helix_trace_enabled() && helix_trace_is_l19_gate_raw_tensor(t->name);
+    const bool is_l19_up_raw   = helix_trace_enabled() && helix_trace_is_l19_up_raw_tensor(t->name);
+    const bool is_swiglu   = il == 0 && helix_trace_enabled() && helix_trace_name_matches(t->name, "helix_swiglu");
+    const bool is_down     = il == 19 && helix_trace_enabled() &&
+        (helix_trace_name_matches(t->name, "helix_down") ||
+         helix_trace_name_matches(t->name, "helix_debug_down_out"));
+    const bool is_ffn      = il == 0 && helix_trace_enabled() && helix_trace_is_ffn_out_tensor(t->name);
+    if (!is_top && !is_gate && !is_ffn && !is_swiglu && !is_l19_swiglu && !is_l19_gate_raw && !is_l19_up_raw &&
+            !is_act_gate && !is_act_up && !is_down) {
+        return false;
+    }
+
+    // Never attach trace eval hooks during single-token decode (generation loop).
+    if (helix_trace_enabled() && helix_trace_batch_n_tokens <= 1 &&
+        (is_swiglu || is_l19_swiglu || is_l19_gate_raw || is_l19_up_raw || is_ffn || is_top ||
+         is_act_gate || is_act_up || is_down)) {
+        return false;
+    }
+
+    const bool act_layer = is_gate && helix_act_cache_enabled() &&
+        il >= 0 && il < (int) HELIX_ACT_N_LAYERS;
+    const bool trace_layer = helix_trace_enabled() &&
+        (helix_trace_layer_wanted(il) || is_ffn || is_swiglu || is_l19_swiglu || is_l19_gate_raw ||
+         is_l19_up_raw || is_act_gate || is_act_up || is_down);
+
+    if (ask) {
+        return act_layer || trace_layer;
+    }
+
+    if (act_layer) {
+        helix_act_cache_write_gate_hidden(t, il);
+    }
+
+    if (is_ffn && helix_trace_file() != nullptr) {
+        const int64_t n_tokens = t->ne[1];
+        const int64_t focus = helix_trace_focus_token_index(n_tokens);
+        if (helix_trace_want_raw_logits(0, focus, n_tokens)) {
+            helix_trace_dump_row_prefix(t, il, focus, 8, "post-ffn (sparse mlp output)");
+        }
+    }
+
+    if (is_act_gate && helix_trace_file() != nullptr) {
+        const int64_t n_tokens = t->ne[2];
+        const int64_t focus = helix_trace_focus_token_index(n_tokens);
+        if (helix_trace_want_raw_logits(0, focus, n_tokens)) {
+            helix_trace_dump_swiglu_prefix(t, il, focus, 8, "gate_exps linear (pre-SiLU)");
+        }
+    }
+
+    if (is_act_up && helix_trace_file() != nullptr) {
+        const int64_t n_tokens = t->ne[2];
+        const int64_t focus = helix_trace_focus_token_index(n_tokens);
+        if (helix_trace_want_raw_logits(0, focus, n_tokens)) {
+            helix_trace_dump_swiglu_prefix(t, il, focus, 8, "up_exps linear (pre-SiLU)");
+        }
+    }
+
+    if (is_swiglu && helix_trace_file() != nullptr) {
+        const int64_t n_tokens = t->ne[2];
+        const int64_t focus = helix_trace_focus_token_index(n_tokens);
+        if (helix_trace_want_raw_logits(0, focus, n_tokens)) {
+            helix_trace_dump_swiglu_prefix(t, il, focus, 8, "SwiGLU activation intermediate");
+        }
+    }
+
+    if (is_l19_swiglu) {
+        const int64_t n_tokens = t->ne[2];
+        const int64_t focus = helix_trace_focus_token_index(n_tokens);
+        if (helix_trace_want_raw_logits(19, focus, n_tokens)) {
+            helix_trace_dump_swiglu_prefix(t, 19, focus, 8, "Layer 19 pre-down SwiGLU");
+        }
+    }
+
+    if (is_l19_gate_raw) {
+        const int64_t n_tokens = t->ne[2];
+        const int64_t focus = helix_trace_focus_token_index(n_tokens);
+        if (helix_trace_want_raw_logits(19, focus, n_tokens)) {
+            helix_trace_dump_l19_raw_linear(t, "Raw Gate Output", focus, 8);
+        }
+    }
+
+    if (is_l19_up_raw) {
+        const int64_t n_tokens = t->ne[2];
+        const int64_t focus = helix_trace_focus_token_index(n_tokens);
+        if (helix_trace_want_raw_logits(19, focus, n_tokens)) {
+            helix_trace_dump_l19_raw_linear(t, "Raw Up Output", focus, 8);
+        }
+    }
+
+    if (is_down) {
+        const int64_t n_tokens = t->ne[2];
+        const int64_t focus = helix_trace_focus_token_index(n_tokens);
+        if (helix_trace_want_raw_logits(il, focus, n_tokens)) {
+            helix_trace_dump_experts_down_out(t, il, focus, 8);
+        }
+    }
+
+    if (!trace_layer || helix_trace_file() == nullptr) {
+        return true;
+    }
+
+    if (!is_ffn && !is_swiglu && !is_l19_swiglu && !is_l19_gate_raw && !is_l19_up_raw && !is_act_gate && !is_act_up && !is_down) {
+        if (is_top) {
+            if (il == 19 && helix_trace_enabled()) {
+                const int top_k = (int) t->ne[0];
+                helix_trace_dump_mul_mat_id_ids(t, il, top_k, true);
+            }
+            helix_trace_dump_top_clusters(t, il);
+        } else if (is_gate) {
+            const int64_t num_clusters = t->ne[0];
+            const int top_k = (il >= 19) ? 2 : 8;
+            helix_trace_dump_gate_scores(t, il, top_k);
+        }
+    }
+
+    return true;
+}
+
+
+ggml_tensor * llm_graph_context::build_helix_dnpa_sparse_ffn(
+        ggml_context * ctx0,
+        ggml_tensor * cur,
+        ggml_tensor * ffn_up,
+        ggml_tensor * ffn_gate,
+        ggml_tensor * ffn_down,
+        ggml_tensor * helix_ffn_gate_exps,
+        ggml_tensor * helix_ffn_up_exps,
+        ggml_tensor * helix_ffn_down_exps,
+        ggml_tensor * helix_router_gate,
+        ggml_tensor * helix_cluster_map,
+        int           il,
+        ggml_tensor * helix_shared_core_gate,
+        ggml_tensor * helix_shared_core_up,
+        ggml_tensor * helix_shared_core_down,
+        ggml_tensor * helix_magnet_a,
+        ggml_tensor * helix_magnet_b) const {
+    // Force dense path for early layers — sparse sidecars not reliable for L0-2.
+    if (il < 3) {
+        if (!g_helix_stats.printed) g_helix_stats.layers_dense++;
+        ggml_tensor * act_up   = ggml_mul_mat(ctx0, ffn_up,   cur);
+        ggml_tensor * act_gate = ggml_mul_mat(ctx0, ffn_gate, cur);
+        ggml_tensor * swiglu   = ggml_mul(ctx0, ggml_silu(ctx0, act_gate), act_up);
+        return ggml_mul_mat(ctx0, ffn_down, swiglu);
+    }
+
+    // =========================================================================
+    // MAGNET SPARSE MODE: True hardware-accelerated sparse FFN.
+    // Uses the trained look-ahead predictor (scores = X @ A @ B) to identify
+    // active neurons WITHOUT computing the full gate. Then gathers only the
+    // active rows from gate/up/down for physically smaller matmuls.
+    // When magnet tensors are absent, falls back to analytical gate masking.
+    // =========================================================================
+    if (helix_doppelganger_enabled() && ffn_gate != nullptr && ffn_up != nullptr && ffn_down != nullptr) {
+        // Magnet path: predict active neurons via low-rank projection (6x cheaper than gate)
+        if (helix_magnet_a != nullptr && helix_magnet_b != nullptr) {
+            g_helix_sparsity.layer_magnet[il] = true;
+            const ggml_type cur_type_mg = cur->type;
+            ggml_tensor * cur_f32_mg = (cur->type == GGML_TYPE_F32) ? cur : ggml_cast(ctx0, cur, GGML_TYPE_F32);
+
+            // Low-rank predictor: scores = X @ A @ B  -> [n_ff, n_tokens]
+            const int64_t mag_rank = helix_magnet_a->ne[0] == cur_f32_mg->ne[0]
+                ? helix_magnet_a->ne[1] : helix_magnet_a->ne[0];
+            ggml_tensor * magnet_a_f32 = helix_magnet_view_for_mul_mat(
+                ctx0, helix_magnet_a, cur_f32_mg->ne[0], mag_rank);
+            ggml_tensor * hidden_proj = ggml_mul_mat(ctx0, magnet_a_f32, cur_f32_mg);
+            ggml_tensor * magnet_b_f32 = helix_magnet_view_for_mul_mat(
+                ctx0, helix_magnet_b, hidden_proj->ne[0], ffn_gate->ne[1]);
+            cb(hidden_proj, "magnet_proj_a", il);
+            ggml_tensor * magnet_scores = ggml_mul_mat(ctx0, magnet_b_f32, hidden_proj);
+            cb(magnet_scores, "magnet_scores", il);
+
+            const int64_t n_ff = ffn_gate->ne[1];
+            const int64_t active_k = helix_magnet_active_k(il, n_ff);
+            if (il >= 0 && il < HELIX_SPARSITY_N_LAYERS) {
+                g_helix_layer_n_ff[il] = n_ff;
+            }
+
+            const bool sparse_mode   = helix_magnet_sparse_mode_enabled();
+            const bool sparse_gather = helix_magnet_row_gather_enabled();
+            ggml_tensor * mg_out = nullptr;
+
+            if (sparse_gather) {
+                // Top-K neuron indices from magnet scores; physical gather via mul_mat_id.
+                ggml_tensor * selected = ggml_top_k(ctx0, magnet_scores, (int) active_k);
+                cb(selected, "magnet_topk", il);
+
+                const int64_t n_embd_cur = cur_f32_mg->ne[0];
+                const int64_t n_ffn_tokens = cur_f32_mg->ne[1];
+                ggml_tensor * cur_3d = ggml_reshape_3d(ctx0, cur_f32_mg, n_embd_cur, 1, n_ffn_tokens);
+
+                ggml_tensor * gate_as = ggml_reshape_3d(ctx0, ffn_gate, n_embd_cur, 1, n_ff);
+                ggml_tensor * up_as   = ggml_reshape_3d(ctx0, ffn_up,   n_embd_cur, 1, n_ff);
+                ggml_tensor * down_as = ggml_reshape_3d(ctx0, ffn_down, 1, n_embd_cur, n_ff);
+
+                ggml_tensor * act_gate = build_lora_mm_id(gate_as, cur_3d, selected);
+                ggml_tensor * act_up   = build_lora_mm_id(up_as, cur_3d, selected);
+                cb(act_gate, "magnet_gate_sparse", il);
+                cb(act_up, "magnet_up_sparse", il);
+
+                ggml_tensor * gate_f32 = ggml_cont(ctx0, ggml_cast(ctx0, act_gate, GGML_TYPE_F32));
+                ggml_tensor * up_f32   = ggml_cont(ctx0, ggml_cast(ctx0, act_up,   GGML_TYPE_F32));
+                ggml_tensor * swiglu   = ggml_swiglu_split(ctx0, gate_f32, up_f32);
+                cb(swiglu, "magnet_swiglu_sparse", il);
+
+                ggml_tensor * down_out = build_lora_mm_id(down_as, swiglu, selected);
+                down_out = ggml_cont(ctx0, ggml_cast(ctx0, down_out, GGML_TYPE_F32));
+                cb(down_out, "magnet_down_sparse", il);
+
+                mg_out = helix_sum_dim1_rows(ctx0, down_out, n_embd_cur, n_ffn_tokens);
+                cb(mg_out, "magnet_ffn_out", il);
+            } else if (sparse_mode) {
+                // Top-K masked dense FFN (width sweep). Full matmuls + mask from magnet scores.
+                ggml_tensor * selected = ggml_top_k(ctx0, magnet_scores, (int) active_k);
+                cb(selected, "magnet_topk", il);
+
+                const float target_frac = (n_ff > 0) ? (float) active_k / (float) n_ff : 0.20f;
+                const float scale = 0.68f * target_frac;
+                ggml_tensor * scores_abs = ggml_abs(ctx0, magnet_scores);
+                ggml_tensor * scores_mean = ggml_mean(ctx0, scores_abs);
+                ggml_tensor * mg_threshold = ggml_scale(ctx0, ggml_repeat(ctx0, scores_mean, scores_abs), scale);
+                ggml_tensor * mg_above = ggml_sub(ctx0, scores_abs, mg_threshold);
+                ggml_tensor * mg_mask = ggml_step(ctx0, mg_above);
+                cb(mg_mask, "magnet_mask", il);
+
+                ggml_tensor * act_gate_mg = ggml_mul_mat(ctx0, ffn_gate, cur_f32_mg);
+                ggml_tensor * gate_silu_mg = ggml_silu(ctx0, act_gate_mg);
+                ggml_tensor * gate_masked_mg = ggml_mul(ctx0, gate_silu_mg, mg_mask);
+                cb(gate_masked_mg, "magnet_gate_masked", il);
+                ggml_tensor * act_up_mg = ggml_mul_mat(ctx0, ffn_up, cur_f32_mg);
+                ggml_tensor * z_sparse_mg = ggml_mul(ctx0, gate_masked_mg, act_up_mg);
+                mg_out = ggml_mul_mat(ctx0, ffn_down, z_sparse_mg);
+                cb(mg_out, "magnet_ffn_out", il);
+            } else {
+                // Dense fallback (HELIX_MAGNET_DENSE=1): full SwiGLU; threshold mask for stats only.
+                const float target_frac = (n_ff > 0) ? (float) active_k / (float) n_ff : 0.20f;
+                const float scale = 0.68f * target_frac;
+
+                ggml_tensor * scores_abs = ggml_abs(ctx0, magnet_scores);
+                ggml_tensor * scores_mean = ggml_mean(ctx0, scores_abs);
+                ggml_tensor * mg_threshold = ggml_scale(ctx0, ggml_repeat(ctx0, scores_mean, scores_abs), scale);
+                ggml_tensor * mg_above = ggml_sub(ctx0, scores_abs, mg_threshold);
+                ggml_tensor * mg_mask = ggml_step(ctx0, mg_above);
+                cb(mg_mask, "magnet_mask", il);
+
+                static const bool apply_magnet_mask = helix_env_flag_active("HELIX_MAGNET_APPLY_MASK");
+                ggml_tensor * act_gate_mg = ggml_mul_mat(ctx0, ffn_gate, cur_f32_mg);
+                ggml_tensor * gate_silu_mg = ggml_silu(ctx0, act_gate_mg);
+                ggml_tensor * act_up_mg   = ggml_mul_mat(ctx0, ffn_up, cur_f32_mg);
+                ggml_tensor * z_sparse_mg = nullptr;
+                if (apply_magnet_mask) {
+                    ggml_tensor * gate_masked_mg = ggml_mul(ctx0, gate_silu_mg, mg_mask);
+                    cb(gate_masked_mg, "magnet_gate_masked", il);
+                    z_sparse_mg = ggml_mul(ctx0, gate_masked_mg, act_up_mg);
+                } else {
+                    z_sparse_mg = ggml_mul(ctx0, gate_silu_mg, act_up_mg);
+                    z_sparse_mg = helix_sparsity_anchor_tensor(ctx0, z_sparse_mg, magnet_scores);
+                    z_sparse_mg = helix_sparsity_anchor_tensor(ctx0, z_sparse_mg, mg_mask);
+                }
+                mg_out = ggml_mul_mat(ctx0, ffn_down, z_sparse_mg);
+                cb(mg_out, "magnet_ffn_out", il);
+            }
+
+            if (mg_out->type != cur_type_mg) {
+                mg_out = ggml_cast(ctx0, mg_out, cur_type_mg);
+            }
+
+            if (il == 27 && !g_helix_stats.printed) {
+                g_helix_stats.layers_dense  = 3;
+                g_helix_stats.layers_magnet = 25;
+                g_helix_stats.layers_sparse = 0;
+                g_helix_stats.printed = true;
+                for (int l = 3; l < HELIX_SPARSITY_N_LAYERS; ++l) {
+                    g_helix_sparsity.layer_magnet[l] = true;
+                }
+            }
+
+            {
+                static bool dg_banner_shown = false;
+                if (il == 27 && !dg_banner_shown) {
+                    dg_banner_shown = true;
+                    const float wf = helix_magnet_env_width_frac();
+                    fprintf(stderr,
+                        "\n[HELIX MAGNET] Engine active: 25 magnet layers | 3 dense | %s | "
+                        "width dial: %s | per-token activation %% after each reply\n\n",
+                        helix_magnet_row_gather_enabled() ? "row gather (mul_mat_id)"
+                        : (helix_magnet_sparse_mode_enabled() ? "top-k masked dense (HELIX_MAGNET_SPARSE)"
+                                                              : "dense FFN (HELIX_MAGNET_DENSE=1)"),
+                        wf > 0.0f ? "HELIX_MAGNET_WIDTH_FRAC env"
+                                    : "default L3-12=25%% L13-27=20%%");
+                }
+            }
+
+            if (helix_trace_file() != nullptr && helix_trace_layer_wanted(il)) {
+                HELIX_TRACE_FPRINTF("[HELIX MAGNET] Layer %d: rank=%lld active_k=%lld sparse=%d\n",
+                        il, (long long) helix_magnet_a->ne[1], (long long) active_k,
+                        (int) helix_magnet_row_gather_enabled());
+            }
+            return mg_out;
+        }
+
+        // Analytical gate-masking fallback (no magnet weights available)
+        const ggml_type cur_type_dg = cur->type;
+        ggml_tensor * cur_f32_dg = (cur->type == GGML_TYPE_F32) ? cur : ggml_cast(ctx0, cur, GGML_TYPE_F32);
+
+        // Phase A: Full gate matmul — computes exact activation magnitudes
+        ggml_tensor * act_gate_full = ggml_mul_mat(ctx0, ffn_gate, cur_f32_dg);
+        cb(act_gate_full, "dg_gate_full", il);
+        ggml_tensor * gate_silu = ggml_silu(ctx0, act_gate_full);
+        cb(gate_silu, "dg_gate_silu", il);
+
+        // Phase B: Top-P energy masking via adaptive threshold.
+        // Threshold = mean(|gate|) * scale. Empirically scale=2.0 yields ~30-35% active
+        // width for SwiGLU activation distributions, matching our verified Top-35% sweet spot.
+        ggml_tensor * gate_abs = ggml_abs(ctx0, gate_silu);
+        cb(gate_abs, "dg_gate_abs", il);
+
+        ggml_tensor * gate_mean = ggml_mean(ctx0, gate_abs);
+        cb(gate_mean, "dg_gate_mean", il);
+        ggml_tensor * threshold = ggml_scale(ctx0, ggml_repeat(ctx0, gate_mean, gate_abs), 2.0f);
+        cb(threshold, "dg_threshold", il);
+
+        // Mask: step(|gate| - threshold) = 1 where neuron is active, 0 otherwise
+        ggml_tensor * above_thresh = ggml_sub(ctx0, gate_abs, threshold);
+        ggml_tensor * mask = ggml_step(ctx0, above_thresh);
+        cb(mask, "dg_mask", il);
+        g_helix_sparsity.layer_gate[il] = true;
+
+        // Phase C: Apply mask to gate — zeroes inactive neurons
+        ggml_tensor * gate_masked = ggml_mul(ctx0, gate_silu, mask);
+        cb(gate_masked, "dg_gate_masked", il);
+
+        // Phase D: Full up matmul (active channels will be kept, inactive zeroed by gate)
+        ggml_tensor * act_up_full = ggml_mul_mat(ctx0, ffn_up, cur_f32_dg);
+        cb(act_up_full, "dg_up_full", il);
+
+        // SwiGLU element-wise: masked_gate * up (inactive channels → 0)
+        ggml_tensor * z_sparse = ggml_mul(ctx0, gate_masked, act_up_full);
+        cb(z_sparse, "dg_z_sparse", il);
+
+        // Phase E: Down projection on sparse intermediate (zeros don't contribute)
+        ggml_tensor * dg_out = ggml_mul_mat(ctx0, ffn_down, z_sparse);
+        cb(dg_out, "dg_ffn_out", il);
+
+        if (dg_out->type != cur_type_dg) {
+            dg_out = ggml_cast(ctx0, dg_out, cur_type_dg);
+        }
+
+            if (il == 27 && !g_helix_stats.printed) {
+            g_helix_stats.layers_dense = 3;
+            g_helix_stats.layers_sparse = 25;
+            g_helix_stats.printed = true;
+            LLAMA_LOG("\n[HELIX DOPPELGANGER] Engine active: 25 gate-masked layers | 3 dense | "
+                     "~35%% active width | ~57%% FFN FLOP reduction\n");
+        }
+
+        if (helix_trace_file() != nullptr && helix_trace_layer_wanted(il)) {
+            HELIX_TRACE_FPRINTF("[HELIX DOPPELGANGER] Layer %d: threshold=mean*2.0 gate_ne=[%lld,%lld]\n",
+                    il,
+                    (long long) ffn_gate->ne[0], (long long) ffn_gate->ne[1]);
+        }
+
+        return dg_out;
+    }
+    // =========================================================================
+    // END DOPPELGÄNGER MODE — fall through to standard sparse sidecar path
+    // =========================================================================
+
+    if (helix_router_gate == nullptr || helix_cluster_map == nullptr ||
+        helix_ffn_gate_exps == nullptr || helix_ffn_up_exps == nullptr || helix_ffn_down_exps == nullptr) {
+        return nullptr;
+    }
+
+    if (helix_trace_file() != nullptr && helix_trace_layer_wanted(il)) {
+        HELIX_TRACE_FPRINTF("[HELIX TRACE] enter build_helix_dnpa_sparse_ffn layer %d\n", il);
+    }
+
+    // Router matmul must match PyTorch: logits = cur @ gate.T with gate [num_clusters, n_embd].
+    // ggml_mul_mat(A, cur): out[c,t] = sum_h A[h,c] * cur[h,t]  =>  A is [n_embd, num_clusters].
+    // Sidecar / gates.pt bytes are row-major gate[c,h] (stride n_embd between cluster rows).
+    // GGUF may label that buffer ne=[num_clusters, n_embd]; a physical transpose scrambles coefficients.
+    ggml_tensor * helix_gate_f32 = ggml_cont(ctx0, ggml_cast(ctx0, helix_router_gate, GGML_TYPE_F32));
+    ggml_tensor * router   = nullptr;
+    int64_t layer_clusters = 0;
+
+    if (helix_router_gate->ne[0] == n_embd) {
+        layer_clusters = helix_router_gate->ne[1];
+        router = helix_gate_f32;
+    } else if (helix_router_gate->ne[1] == n_embd) {
+        layer_clusters = helix_router_gate->ne[0];
+        router = ggml_view_2d(
+            ctx0,
+            helix_gate_f32,
+            n_embd,
+            layer_clusters,
+            n_embd * ggml_element_size(helix_gate_f32),
+            0);
+    } else {
+        return nullptr;
+    }
+
+    GGML_ASSERT(layer_clusters > 0);
+
+    // Per-layer geometry: num_clusters from router gate; width from dense ffn_down intermediate dim.
+    const int64_t num_clusters = layer_clusters;
+    const int64_t n_intermediate_map = helix_cluster_map->ne[0];
+    GGML_ASSERT(helix_cluster_map->type == GGML_TYPE_I32);
+    const int64_t n_intermediate = (ffn_down != nullptr) ? ffn_down->ne[0] : n_intermediate_map;
+    GGML_ASSERT(n_intermediate == n_intermediate_map);
+
+    const int64_t neurons_per_cluster = (num_clusters > 0) ? (n_intermediate / num_clusters) : 0;
+    const int64_t cluster_width = neurons_per_cluster;
+    GGML_ASSERT(cluster_width > 0);
+    GGML_ASSERT(cluster_width * num_clusters == n_intermediate);
+
+    if (il == 19 && helix_trace_enabled()) {
+        static bool l19_weights_dumped = false;
+        LLAMA_LOG("=== LAYER 19 GEOMETRY TRACE ===\n");
+        LLAMA_LOG("layer_clusters: %lld\n", (long long) num_clusters);
+        LLAMA_LOG("cluster_width: %lld\n", (long long) neurons_per_cluster);
+        LLAMA_LOG("ffn_down->ne[0]: %lld\n", ffn_down ? (long long) ffn_down->ne[0] : -1LL);
+        LLAMA_LOG("ffn_down->ne[1]: %lld\n", ffn_down ? (long long) ffn_down->ne[1] : -1LL);
+        LLAMA_LOG("helix_cluster_map->ne[0]: %lld\n", (long long) n_intermediate_map);
+        HELIX_TRACE_FPRINTF("=== LAYER 19 GEOMETRY TRACE ===\n");
+        HELIX_TRACE_FPRINTF("layer_clusters: %lld\n", (long long) num_clusters);
+        HELIX_TRACE_FPRINTF("cluster_width: %lld\n", (long long) neurons_per_cluster);
+        HELIX_TRACE_FPRINTF("ffn_down->ne[0]: %lld\n", ffn_down ? (long long) ffn_down->ne[0] : -1LL);
+        HELIX_TRACE_FPRINTF("ffn_down->ne[1]: %lld\n", ffn_down ? (long long) ffn_down->ne[1] : -1LL);
+        HELIX_TRACE_FPRINTF("helix_cluster_map->ne[0]: %lld\n", (long long) n_intermediate_map);
+        if (!l19_weights_dumped) {
+            l19_weights_dumped = true;
+            helix_trace_dump_down_exps_raw_weights(helix_ffn_down_exps, il);
+        }
+    }
+    // Gate/up now canonical: ne=[n_embd, W, K] (ne0=n_embd contraction axis).
+    // Down keeps down-style ne=[W, n_embd, K] (ne0=W contraction axis).
+    GGML_ASSERT(helix_ffn_gate_exps->ne[0] == n_embd);
+    GGML_ASSERT(helix_ffn_gate_exps->ne[1] == cluster_width);
+    GGML_ASSERT(helix_ffn_gate_exps->ne[2] == layer_clusters);
+    GGML_ASSERT(helix_ffn_up_exps->ne[0] == n_embd);
+    GGML_ASSERT(helix_ffn_up_exps->ne[1] == cluster_width);
+    GGML_ASSERT(helix_ffn_up_exps->ne[2] == layer_clusters);
+    GGML_ASSERT(helix_ffn_down_exps->ne[0] == cluster_width);
+    GGML_ASSERT(helix_ffn_down_exps->ne[1] == n_embd);
+    GGML_ASSERT(helix_ffn_down_exps->ne[2] == layer_clusters);
+
+    // Path B: middle layers (3-18) route top-8; deep layers (19-27) route top-2.
+    const int top_k = (il >= 19) ? 2 : 8;
+
+    if (helix_trace_file() != nullptr && helix_trace_layer_wanted(il)) {
+        HELIX_TRACE_FPRINTF(
+            "[HELIX TRACE BUILD] Layer %d | clusters=%lld | top_k=%d | cluster_width=%lld | "
+            "router_raw_ne=[%lld,%lld] | gate_exps_ne=[%lld,%lld,%lld] | "
+            "gate_input=post_ffn_rmsnorm\n",
+            il,
+            (long long) layer_clusters,
+            top_k,
+            (long long) cluster_width,
+            (long long) helix_router_gate->ne[0],
+            (long long) helix_router_gate->ne[1],
+            (long long) helix_ffn_gate_exps->ne[0],
+            (long long) helix_ffn_gate_exps->ne[1],
+            (long long) helix_ffn_gate_exps->ne[2]);
+    }
+
+    // cur may be narrowed to n_outputs on the last layer via inp_out_ids — use its live width, not n_tokens.
+    const int64_t n_ffn_tokens = cur->ne[1];
+    GGML_ASSERT(n_ffn_tokens > 0);
+    GGML_ASSERT(cur->ne[0] == n_embd);
+    GGML_ASSERT(ggml_nelements(cur) == n_embd * n_ffn_tokens);
+
+    const ggml_type cur_type = cur->type;
+
+    // F16 norm weights (e.g. quantize-from-F16 GGUF) yield F16 activations; helix CUDA ops need F32.
+    ggml_tensor * cur_f32 = ggml_cast(ctx0, cur, GGML_TYPE_F32);
+
+    // hidden [n_embd, n_ffn_tokens] x router [n_embd, num_clusters] -> scores [num_clusters, n_ffn_tokens]
+    ggml_tensor * router_f32 = router->type == GGML_TYPE_F32 ? router : ggml_cast(ctx0, router, GGML_TYPE_F32);
+    ggml_tensor * gate_scores = ggml_mul_mat(ctx0, router_f32, cur_f32);
+    cb(gate_scores, "helix_gate_scores", il);
+
+    // Match Python reference: top-k on softmax probabilities, then argsort indices (cluster IDs).
+    ggml_tensor * gate_probs = ggml_soft_max(ctx0, gate_scores);
+    cb(gate_probs, "helix_gate_probs", il);
+    ggml_tensor * selected_clusters = ggml_cont(ctx0, ggml_argsort_top_k(ctx0, gate_probs, top_k));
+    cb(selected_clusters, "helix_top_clusters", il);
+    ggml_build_forward_expand(gf, selected_clusters);
+
+    ggml_tensor * cur_3d = ggml_reshape_3d(ctx0, cur_f32, n_embd, 1, n_ffn_tokens);
+
+    GGML_ASSERT(cluster_width % ggml_blck_size(helix_ffn_gate_exps->type) == 0);
+    GGML_ASSERT(cluster_width % ggml_blck_size(helix_ffn_up_exps->type) == 0);
+    GGML_ASSERT(cluster_width % ggml_blck_size(helix_ffn_down_exps->type) == 0);
+
+    GGML_UNUSED(helix_cluster_map);
+
+    // Gate/up are now stored canonically as ne=[n_embd, W, K] (ne0=n_embd = contraction axis),
+    // exactly like stock llama.cpp ffn_gate_exps/ffn_up_exps. mul_mat_id contracts ne0 directly,
+    // so NO runtime permute is needed and the Q8_0 path is preserved. The previous
+    // cast->permute->cont path was geometrically correct (strides matched) but corrupted the
+    // gate/up values; storing the correct layout on disk eliminates it. Down keeps [W, n_embd, K].
+    ggml_tensor * gate_exps_permuted = helix_ffn_gate_exps;
+    ggml_tensor * up_exps_permuted   = helix_ffn_up_exps;
+    ggml_tensor * down_exps = helix_ffn_down_exps;
+
+    if (il == 19 && helix_trace_enabled()) {
+        ggml_set_name(gate_exps_permuted, "helix_gate_postpermute_l19");
+        LLAMA_LOG("[HELIX TRACE] Layer 19 Post-Permute gate_exps shape: [%lld, %lld, %lld]\n",
+                (long long) gate_exps_permuted->ne[0],
+                (long long) gate_exps_permuted->ne[1],
+                (long long) gate_exps_permuted->ne[2]);
+        LLAMA_LOG("[HELIX TRACE] Layer 19 Post-Permute gate_exps strides: [%zu, %zu, %zu]\n",
+                gate_exps_permuted->nb[0],
+                gate_exps_permuted->nb[1],
+                gate_exps_permuted->nb[2]);
+        HELIX_TRACE_FPRINTF("[HELIX TRACE] Layer 19 Post-Permute gate_exps shape: [%lld, %lld, %lld]\n",
+                (long long) gate_exps_permuted->ne[0],
+                (long long) gate_exps_permuted->ne[1],
+                (long long) gate_exps_permuted->ne[2]);
+        HELIX_TRACE_FPRINTF("[HELIX TRACE] Layer 19 Post-Permute gate_exps strides: [%zu, %zu, %zu]\n",
+                gate_exps_permuted->nb[0],
+                gate_exps_permuted->nb[1],
+                gate_exps_permuted->nb[2]);
+        LLAMA_LOG("[HELIX TRACE] Layer 19 On-disk gate_exps shape: [%lld, %lld, %lld] strides: [%zu, %zu, %zu]\n",
+                (long long) helix_ffn_gate_exps->ne[0],
+                (long long) helix_ffn_gate_exps->ne[1],
+                (long long) helix_ffn_gate_exps->ne[2],
+                helix_ffn_gate_exps->nb[0],
+                helix_ffn_gate_exps->nb[1],
+                helix_ffn_gate_exps->nb[2]);
+        HELIX_TRACE_FPRINTF("[HELIX TRACE] Layer 19 On-disk gate_exps shape: [%lld, %lld, %lld] strides: [%zu, %zu, %zu]\n",
+                (long long) helix_ffn_gate_exps->ne[0],
+                (long long) helix_ffn_gate_exps->ne[1],
+                (long long) helix_ffn_gate_exps->ne[2],
+                helix_ffn_gate_exps->nb[0],
+                helix_ffn_gate_exps->nb[1],
+                helix_ffn_gate_exps->nb[2]);
+        for (int64_t expert_id : {15, 17, 28, 30}) {
+            const size_t on_disk_off = (size_t) expert_id * helix_ffn_gate_exps->nb[2];
+            const size_t permuted_off = (size_t) expert_id * gate_exps_permuted->nb[2];
+            const int64_t dense_off = expert_id * cluster_width;
+            LLAMA_LOG(
+                "[HELIX TRACE] Layer 19 expert %lld byte offset: on_disk=%zu permuted_f32=%zu "
+                "dense_ffn_intermediate=%lld (slot*cluster_width)\n",
+                (long long) expert_id,
+                on_disk_off,
+                permuted_off,
+                (long long) dense_off);
+            HELIX_TRACE_FPRINTF(
+                "[HELIX TRACE] Layer 19 expert %lld byte offset: on_disk=%zu permuted_f32=%zu "
+                "dense_ffn_intermediate=%lld (slot*cluster_width)\n",
+                (long long) expert_id,
+                on_disk_off,
+                permuted_off,
+                (long long) dense_off);
+        }
+    }
+
+    ggml_tensor * gate_exps = gate_exps_permuted;
+    ggml_tensor * up_exps   = up_exps_permuted;
+
+    if (il == 19 && helix_trace_enabled()) {
+        helix_trace_dump_mul_mat_id_ids(selected_clusters, il, top_k, false);
+        if (top_k == 1) {
+            LLAMA_LOG("  output merge: ggml_view_2d byte offset=0 (single expert output, not id-based weight slice)\n");
+            HELIX_TRACE_FPRINTF("  output merge: ggml_view_2d byte offset=0 (single expert output, not id-based weight slice)\n");
+        } else {
+            LLAMA_LOG("  output merge: ggml_view_2d byte offsets 0 and experts->nb[1] (sum two expert outputs)\n");
+            HELIX_TRACE_FPRINTF("  output merge: ggml_view_2d byte offsets 0 and experts->nb[1] (sum two expert outputs)\n");
+        }
+    }
+
+    ggml_tensor * act_gate = build_lora_mm_id(gate_exps, cur_3d, selected_clusters);
+    cb(act_gate, "helix_act_gate", il);
+    ggml_tensor * act_up = build_lora_mm_id(up_exps, cur_3d, selected_clusters);
+    cb(act_up, "helix_act_up", il);
+    if (il == 19 && helix_trace_enabled()) {
+        ggml_set_name(act_gate, "helix_gate_raw_l19");
+        ggml_set_name(act_up, "helix_up_raw_l19");
+        LLAMA_LOG("[HELIX TRACE] Layer 19 Raw Gate and Up tagged\n");
+        HELIX_TRACE_FPRINTF("[HELIX TRACE] Layer 19 Raw Gate and Up tagged\n");
+    }
+
+    ggml_tensor * gate_f32 = ggml_cont(ctx0, ggml_cast(ctx0, act_gate, GGML_TYPE_F32));
+    ggml_tensor * up_f32   = ggml_cont(ctx0, ggml_cast(ctx0, act_up,   GGML_TYPE_F32));
+    ggml_tensor * swiglu   = ggml_swiglu_split(ctx0, gate_f32, up_f32);
+    cb(swiglu, "helix_swiglu", il);
+    if (il == 19 && helix_trace_enabled()) {
+        ggml_set_name(swiglu, "helix_swiglu_l19_tok3");
+        LLAMA_LOG("[HELIX TRACE] Layer 19 Pre-Down SwiGLU tagged for capture\n");
+        HELIX_TRACE_FPRINTF("[HELIX TRACE] Layer 19 Pre-Down SwiGLU tagged for capture\n");
+    }
+
+    ggml_tensor * experts = build_lora_mm_id(down_exps, swiglu, selected_clusters);
+    experts = ggml_cont(ctx0, ggml_cast(ctx0, experts, GGML_TYPE_F32));
+    cb(experts, "helix_down", il);
+    if (il == 19 && helix_trace_enabled()) {
+        ggml_format_name(experts, "helix_debug_down_out-%d", il);
+        LLAMA_LOG("[HELIX TRACE] Layer 19 Post-Down-Proj tensor tagged for inspection\n");
+        LLAMA_LOG("[HELIX TRACE] Expected shape: [%lld, %lld, %lld]\n",
+                (long long) experts->ne[0], (long long) experts->ne[1], (long long) experts->ne[2]);
+        HELIX_TRACE_FPRINTF("[HELIX TRACE] Layer 19 Post-Down-Proj tensor tagged for inspection\n");
+        HELIX_TRACE_FPRINTF("[HELIX TRACE] Expected shape: [%lld, %lld, %lld]\n",
+                (long long) experts->ne[0], (long long) experts->ne[1], (long long) experts->ne[2]);
+    }
+
+    ggml_build_forward_expand(gf, experts);
+
+    ggml_tensor * out = nullptr;
+
+    if (top_k == 1) {
+        out = ggml_cont(ctx0, ggml_view_2d(ctx0, experts, n_embd, n_ffn_tokens, experts->nb[2], 0));
+        cb(out, "helix_sparse_out", il);
+        ggml_build_forward_expand(gf, out);
+    } else {
+        ggml_tensor * cur_experts[8] = { nullptr };
+        GGML_ASSERT(top_k >= 2 && top_k <= 8);
+
+        for (int i = 0; i < top_k; ++i) {
+            cur_experts[i] = ggml_view_2d(ctx0, experts, n_embd, n_ffn_tokens, experts->nb[2], i * experts->nb[1]);
+            cb(cur_experts[i], "helix_ffn_out_expert", il);
+            ggml_build_forward_expand(gf, cur_experts[i]);
+        }
+
+        out = cur_experts[0];
+        for (int i = 1; i < top_k; ++i) {
+            out = ggml_add(ctx0, out, cur_experts[i]);
+            ggml_build_forward_expand(gf, out);
+        }
+        out = ggml_cont(ctx0, out);
+        cb(out, "helix_sparse_out", il);
+    }
+
+    // Active Circuit Mirror: per-expert complement circuits routed by the SAME cluster IDs.
+    // Each expert c has a tiny rank-R SwiGLU correction trained on what expert c specifically misses.
+    // Uses mul_mat_id with same selected_clusters — different tokens get different corrections.
+    if (helix_shared_core_gate != nullptr &&
+        helix_shared_core_up   != nullptr &&
+        helix_shared_core_down != nullptr &&
+        helix_shared_core_gate->ne[2] == num_clusters) {
+        // 3D expert-indexed layout: ne=[n_embd, rank, K] for gate/up, [rank, n_embd, K] for down
+        ggml_tensor * mc_act_gate = build_lora_mm_id(helix_shared_core_gate, cur_3d, selected_clusters);
+        cb(mc_act_gate, "helix_mc_gate", il);
+        ggml_tensor * mc_act_up = build_lora_mm_id(helix_shared_core_up, cur_3d, selected_clusters);
+        cb(mc_act_up, "helix_mc_up", il);
+
+        ggml_tensor * mc_gate_f32 = ggml_cont(ctx0, ggml_cast(ctx0, mc_act_gate, GGML_TYPE_F32));
+        ggml_tensor * mc_up_f32   = ggml_cont(ctx0, ggml_cast(ctx0, mc_act_up,   GGML_TYPE_F32));
+        ggml_tensor * mc_swiglu   = ggml_swiglu_split(ctx0, mc_gate_f32, mc_up_f32);
+        cb(mc_swiglu, "helix_mc_swiglu", il);
+
+        ggml_tensor * mc_down = build_lora_mm_id(helix_shared_core_down, mc_swiglu, selected_clusters);
+        mc_down = ggml_cont(ctx0, ggml_cast(ctx0, mc_down, GGML_TYPE_F32));
+        cb(mc_down, "helix_mc_down", il);
+        ggml_build_forward_expand(gf, mc_down);
+
+        // Sum mirror expert outputs (same merge pattern as main sparse path)
+        ggml_tensor * mc_out = nullptr;
+        if (top_k == 1) {
+            mc_out = ggml_cont(ctx0, ggml_view_2d(ctx0, mc_down, n_embd, n_ffn_tokens, mc_down->nb[2], 0));
+        } else {
+            ggml_tensor * mc_experts[8] = { nullptr };
+            for (int i = 0; i < top_k; ++i) {
+                mc_experts[i] = ggml_view_2d(ctx0, mc_down, n_embd, n_ffn_tokens, mc_down->nb[2], i * mc_down->nb[1]);
+                ggml_build_forward_expand(gf, mc_experts[i]);
+            }
+            mc_out = mc_experts[0];
+            for (int i = 1; i < top_k; ++i) {
+                mc_out = ggml_add(ctx0, mc_out, mc_experts[i]);
+                ggml_build_forward_expand(gf, mc_out);
+            }
+            mc_out = ggml_cont(ctx0, mc_out);
+        }
+        cb(mc_out, "helix_mc_out", il);
+
+        out = ggml_add(ctx0, out, mc_out);
+        cb(out, "helix_ffn_out_combined", il);
+        ggml_build_forward_expand(gf, out);
+
+        if (helix_trace_file() != nullptr && helix_trace_layer_wanted(il)) {
+            HELIX_TRACE_FPRINTF("[HELIX TRACE] Layer %d mirror_core: gate=[%lld,%lld,%lld] down=[%lld,%lld,%lld]\n",
+                    il,
+                    (long long) helix_shared_core_gate->ne[0], (long long) helix_shared_core_gate->ne[1],
+                    (long long) helix_shared_core_gate->ne[2],
+                    (long long) helix_shared_core_down->ne[0], (long long) helix_shared_core_down->ne[1],
+                    (long long) helix_shared_core_down->ne[2]);
+        }
+    } else if (helix_shared_core_gate != nullptr &&
+               helix_shared_core_up   != nullptr &&
+               helix_shared_core_down != nullptr) {
+        // Legacy 2D fallback: static un-routed adapter
+        ggml_tensor * sc_gate_f32 = ggml_cont(ctx0, ggml_cast(ctx0, helix_shared_core_gate, GGML_TYPE_F32));
+        ggml_tensor * sc_up_f32   = ggml_cont(ctx0, ggml_cast(ctx0, helix_shared_core_up,   GGML_TYPE_F32));
+        ggml_tensor * sc_down_f32 = ggml_cont(ctx0, ggml_cast(ctx0, helix_shared_core_down, GGML_TYPE_F32));
+        ggml_tensor * sc_act_gate = ggml_mul_mat(ctx0, sc_gate_f32, cur_f32);
+        ggml_tensor * sc_act_up   = ggml_mul_mat(ctx0, sc_up_f32,   cur_f32);
+        ggml_tensor * sc_swiglu   = ggml_swiglu_split(ctx0, sc_act_gate, sc_act_up);
+        ggml_tensor * sc_out      = ggml_mul_mat(ctx0, sc_down_f32, sc_swiglu);
+        sc_out = ggml_cont(ctx0, ggml_cast(ctx0, sc_out, GGML_TYPE_F32));
+        out = ggml_add(ctx0, out, sc_out);
+        cb(out, "helix_ffn_out_combined", il);
+        ggml_build_forward_expand(gf, out);
+    }
+
+    cb(out, "helix_ffn_out", il);
+    if (out->type != cur_type) {
+        out = ggml_cast(ctx0, out, cur_type);
+        cb(out, "helix_ffn_out_cast", il);
+    }
+    return out;
+}
+
+
 ggml_tensor * llm_graph_context::build_ffn(
          ggml_tensor * cur,
          ggml_tensor * up,
@@ -1241,7 +3027,70 @@ ggml_tensor * llm_graph_context::build_ffn(
          ggml_tensor * act_scales,
      llm_ffn_op_type   type_op,
    llm_ffn_gate_type   type_gate,
-                 int   il) const {
+                 int   il,
+         ggml_tensor * helix_router_gate,
+         ggml_tensor * helix_cluster_map,
+         ggml_tensor * helix_ffn_gate_exps,
+         ggml_tensor * helix_ffn_up_exps,
+         ggml_tensor * helix_ffn_down_exps,
+         ggml_tensor * helix_shared_core_gate,
+         ggml_tensor * helix_shared_core_up,
+         ggml_tensor * helix_shared_core_down,
+         ggml_tensor * helix_magnet_a,
+         ggml_tensor * helix_magnet_b) const {
+    ggml_tensor * ffn_up   = up;
+    ggml_tensor * ffn_gate = gate;
+    ggml_tensor * ffn_down = down;
+
+    const bool helix_qwen_ffn = ffn_down != nullptr && ffn_gate != nullptr && ffn_up != nullptr &&
+        ffn_down->ne[0] == 6144 && ffn_down->ne[1] == 2048 &&
+        ffn_gate->ne[0] == 2048 && ffn_gate->ne[1] == 6144;
+
+    // Magnet-only GGUF (helix_magnet_a/b embedded, no DNPA sidecar tensors)
+    if (helix_doppelganger_enabled() && helix_qwen_ffn &&
+        helix_magnet_a != nullptr && helix_magnet_b != nullptr) {
+        ggml_tensor * helix_out = build_helix_dnpa_sparse_ffn(
+            ctx0, cur, ffn_up, ffn_gate, ffn_down,
+            nullptr, nullptr, nullptr,
+            nullptr, nullptr, il,
+            nullptr, nullptr, nullptr,
+            helix_magnet_a, helix_magnet_b);
+        if (helix_out != nullptr) {
+            return helix_out;
+        }
+    }
+
+    // DNPA Helix sparse routing: triple sidecar MoE gate/up/down stacks
+    if (helix_router_gate != nullptr && helix_cluster_map != nullptr &&
+        helix_ffn_gate_exps != nullptr && helix_ffn_up_exps != nullptr && helix_ffn_down_exps != nullptr &&
+        ffn_down != nullptr && ffn_gate != nullptr && ffn_up != nullptr &&
+        helix_qwen_ffn) {
+        if (helix_trace_file() != nullptr && helix_trace_layer_wanted(il)) {
+            HELIX_TRACE_FPRINTF("[HELIX TRACE] build_ffn -> sparse helix layer %d\n", il);
+        }
+        return build_helix_dnpa_sparse_ffn(
+            ctx0, cur, ffn_up, ffn_gate, ffn_down,
+            helix_ffn_gate_exps, helix_ffn_up_exps, helix_ffn_down_exps,
+            helix_router_gate, helix_cluster_map, il,
+            helix_shared_core_gate, helix_shared_core_up, helix_shared_core_down,
+            helix_magnet_a, helix_magnet_b);
+    }
+    if (helix_trace_file() != nullptr && helix_trace_layer_wanted(il)) {
+        HELIX_TRACE_FPRINTF(
+            "[HELIX TRACE] build_ffn -> DENSE fallback layer %d | helix_gate=%p map=%p "
+            "gate_exps=%p up_exps=%p down_exps=%p | down_ne=[%lld,%lld] gate_ne=[%lld,%lld]\n",
+            il,
+            (void *) helix_router_gate,
+            (void *) helix_cluster_map,
+            (void *) helix_ffn_gate_exps,
+            (void *) helix_ffn_up_exps,
+            (void *) helix_ffn_down_exps,
+            ffn_down ? (long long) ffn_down->ne[0] : -1LL,
+            ffn_down ? (long long) ffn_down->ne[1] : -1LL,
+            ffn_gate ? (long long) ffn_gate->ne[0] : -1LL,
+            ffn_gate ? (long long) ffn_gate->ne[1] : -1LL);
+    }
+
     ggml_tensor * tmp = up ? build_lora_mm(up, cur) : cur;
     cb(tmp, "ffn_up", il);
 

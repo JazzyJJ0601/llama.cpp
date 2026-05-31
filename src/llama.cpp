@@ -328,6 +328,12 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
             return {-2, nullptr};
         }
 
+        if (params.helix_sidecar_path != nullptr && params.helix_sidecar_path[0] != '\0') {
+            model->load_helix_sidecar(params.helix_sidecar_path);
+        } else {
+            model->validate_helix_layout();
+        }
+
         return {0, model_ptr.release()};
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error loading model: %s\n", __func__, err.what());

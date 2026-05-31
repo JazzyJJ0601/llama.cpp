@@ -306,6 +306,11 @@ static bool tensor_allows_quantization(const llama_model_quantize_params * param
     // NOTE: can't use LLM_TN here because the layer number is not known
     quantize &= name.find("ffn_gate_inp.weight") == std::string::npos;
 
+    // Helix DNPA router gates: keep F16/F32 — Q8_0 destroys low-magnitude routing boundaries
+    quantize &= name.find("helix_router_gate") == std::string::npos;
+    quantize &= name.find("helix_shared_core") == std::string::npos;
+    quantize &= name.find("helix_magnet") == std::string::npos;
+
     // these are very small (e.g. 4x4)
     quantize &= name.find("altup")  == std::string::npos;
     quantize &= name.find("laurel") == std::string::npos;

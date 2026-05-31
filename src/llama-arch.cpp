@@ -550,6 +550,16 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
     { LLM_TENSOR_INDEXER_PROJ,                           "blk.%d.indexer.proj" },
     { LLM_TENSOR_INDEXER_ATTN_K,                         "blk.%d.indexer.attn_k" },
     { LLM_TENSOR_INDEXER_ATTN_Q_B,                       "blk.%d.indexer.attn_q_b" },
+    { LLM_TENSOR_HELIX_ROUTER_GATE,                        "blk.%d.helix_router_gate" },
+    { LLM_TENSOR_HELIX_CLUSTER_MAP,                        "blk.%d.helix_cluster_map" },
+    { LLM_TENSOR_HELIX_FFN_GATE_EXPS,                      "blk.%d.helix_ffn_gate_exps" },
+    { LLM_TENSOR_HELIX_FFN_UP_EXPS,                        "blk.%d.helix_ffn_up_exps" },
+    { LLM_TENSOR_HELIX_FFN_DOWN_EXPS,                      "blk.%d.helix_ffn_down_exps" },
+    { LLM_TENSOR_HELIX_SHARED_CORE_GATE,                   "blk.%d.helix_shared_core_gate" },
+    { LLM_TENSOR_HELIX_SHARED_CORE_UP,                     "blk.%d.helix_shared_core_up" },
+    { LLM_TENSOR_HELIX_SHARED_CORE_DOWN,                   "blk.%d.helix_shared_core_down" },
+    { LLM_TENSOR_HELIX_MAGNET_A,                           "blk.%d.helix_magnet_a" },
+    { LLM_TENSOR_HELIX_MAGNET_B,                           "blk.%d.helix_magnet_b" },
 };
 
 // declare information about the model weight tensors:
@@ -772,6 +782,17 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
     // latent projections feed ggml_mul_mat, the buft probe must use MUL_MAT to keep them on GPU
     {LLM_TENSOR_FFN_LATENT_DOWN,            {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
     {LLM_TENSOR_FFN_LATENT_UP,              {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_HELIX_ROUTER_GATE,          {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    // Metadata index table — must not use GGML_OP_NONE or create_tensor() discards it as "unused".
+    {LLM_TENSOR_HELIX_CLUSTER_MAP,          {LLM_TENSOR_LAYER_REPEATING, GGML_OP_GET_ROWS}},
+    {LLM_TENSOR_HELIX_FFN_GATE_EXPS,        {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_HELIX_FFN_UP_EXPS,          {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_HELIX_FFN_DOWN_EXPS,        {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_HELIX_SHARED_CORE_GATE,     {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_HELIX_SHARED_CORE_UP,       {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_HELIX_SHARED_CORE_DOWN,     {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_HELIX_MAGNET_A,             {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_HELIX_MAGNET_B,             {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
 };
 
 LLM_KV::LLM_KV(llm_arch arch, const char * suffix) : arch(arch), suffix(suffix) {}

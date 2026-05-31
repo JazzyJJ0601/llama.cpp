@@ -2603,6 +2603,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_COMMON, LLAMA_EXAMPLE_EXPORT_LORA}).set_env("LLAMA_ARG_MODEL"));
     add_opt(common_arg(
+        {"--helix-sidecar"}, "FNAME",
+        "path to external Helix routing sidecar binary (self-describing cluster metadata)",
+        [](common_params & params, const std::string & value) {
+            params.helix_sidecar_path = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMMON, LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-mu", "--model-url"}, "MODEL_URL",
         "model download url (default: unused)",
         [](common_params & params, const std::string & value) {

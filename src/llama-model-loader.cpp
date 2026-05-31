@@ -1098,8 +1098,8 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             throw std::runtime_error(format("missing tensor info mapping for %s", tn.str().c_str()));
         }
 
-        // skip unused tensors
-        if (info.op == GGML_OP_NONE || (flags & TENSOR_SKIP)) {
+        // skip unused tensors (metadata tensors opt in via TENSOR_METADATA)
+        if ((info.op == GGML_OP_NONE && !(flags & TENSOR_METADATA)) || (flags & TENSOR_SKIP)) {
             const size_t nbytes = ggml_nbytes(t_meta);
             LLAMA_LOG_WARN("model has unused tensor %s (size = %zu bytes) -- ignoring\n", tn.str().c_str(), nbytes);
 

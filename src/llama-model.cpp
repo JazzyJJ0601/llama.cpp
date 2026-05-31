@@ -19,6 +19,7 @@
 
 #include "ggml.h"
 #include "ggml-cpp.h"
+#include "ggml-backend.h"
 
 #include <algorithm>
 #include <cassert>
@@ -26,6 +27,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cmath>
+#include <fstream>
 #include <functional>
 #include <map>
 #include <numeric>
@@ -948,6 +950,9 @@ struct llama_model::impl {
     // contexts where the model tensors metadata is stored as well as the corresponding buffers:
     std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> ctxs_bufs;
 
+    // Helix sidecar tensors live outside GGUF — keep ctx/buffer pairs alive for model lifetime
+    std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> helix_sidecar_ctxs_bufs;
+
     buft_list_t cpu_buft_list;
     std::map<ggml_backend_dev_t, buft_list_t> gpu_buft_list;
 
@@ -1574,11 +1579,332 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     return true;
 }
 
+namespace {
+
+static bool helix_read_i32(std::ifstream & f, int32_t & val) {
+    f.read(reinterpret_cast<char *>(&val), sizeof(val));
+    return f.gcount() == (std::streamsize) sizeof(val);
+}
+
+static bool helix_read_bytes(std::ifstream & f, void * dst, size_t n) {
+    if (n == 0) {
+        return true;
+    }
+    f.read(reinterpret_cast<char *>(dst), (std::streamsize) n);
+    return f.gcount() == (std::streamsize) n;
+}
+
+static bool helix_read_tensor_payload(std::ifstream & f, ggml_tensor * tensor, size_t n_bytes) {
+    if (tensor == nullptr || n_bytes != ggml_nbytes(tensor)) {
+        return false;
+    }
+
+    if (tensor->buffer != nullptr && ggml_backend_buffer_is_host(tensor->buffer)) {
+        return helix_read_bytes(f, tensor->data, n_bytes);
+    }
+
+    std::vector<uint8_t> staging(n_bytes);
+    if (!helix_read_bytes(f, staging.data(), n_bytes)) {
+        return false;
+    }
+
+    ggml_backend_tensor_set(tensor, staging.data(), 0, n_bytes);
+    return true;
+}
+
+// Canonical layout after embed_helix_into_gguf: map[i] == i / cluster_width (expert slot == cluster id).
+static bool helix_cluster_map_is_canonical(const ggml_tensor * map, int64_t n_clusters, int64_t cluster_width) {
+    if (map == nullptr || map->type != GGML_TYPE_I32) {
+        return false;
+    }
+    if (map->data == nullptr) {
+        LLAMA_LOG_WARN("[HELIX] cluster map tensor has no allocated data (load incomplete?)\n");
+        return false;
+    }
+    if (n_clusters <= 0 || cluster_width <= 0) {
+        return false;
+    }
+    if (map->ne[0] != n_clusters * cluster_width) {
+        return false;
+    }
+
+    std::vector<int32_t> labels(map->ne[0]);
+    ggml_backend_tensor_get(map, labels.data(), 0, labels.size() * sizeof(int32_t));
+
+    for (int64_t c = 0; c < n_clusters; ++c) {
+        if (labels[c * cluster_width] != (int32_t) c) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool helix_gate_up_exps_is_valid(
+        const ggml_tensor * exps,
+        int64_t cluster_width,
+        int64_t n_embd,
+        int64_t n_clusters) {
+    // Canonical gate/up layout: ne=[n_embd, W(cluster_width), K(n_clusters)] (ne0=n_embd).
+    // (Down keeps ne=[cluster_width, n_embd, K]; see helix_down_exps_is_valid.)
+    return exps != nullptr
+        && exps->ne[0] == n_embd
+        && exps->ne[1] == cluster_width
+        && exps->ne[2] == n_clusters;
+}
+
+static bool helix_down_exps_is_valid(
+        const ggml_tensor * exps,
+        int64_t cluster_width,
+        int64_t n_embd,
+        int64_t n_clusters) {
+    return exps != nullptr
+        && exps->ne[0] == cluster_width
+        && exps->ne[1] == n_embd
+        && exps->ne[2] == n_clusters;
+}
+
+static bool helix_layer_layout_is_valid(const llama_layer & layer, int64_t n_embd, int64_t n_ff) {
+    if (layer.helix_router_gate == nullptr || layer.helix_cluster_map == nullptr) {
+        return false;
+    }
+
+    const ggml_tensor * gate = layer.helix_router_gate;
+    int64_t n_clusters = 0;
+    if (gate->ne[0] == n_embd) {
+        n_clusters = gate->ne[1];
+    } else if (gate->ne[1] == n_embd) {
+        n_clusters = gate->ne[0];
+    } else {
+        return false;
+    }
+
+    if (n_clusters <= 0 || n_ff % n_clusters != 0) {
+        return false;
+    }
+
+    const int64_t cluster_width = n_ff / n_clusters;
+    if (!helix_cluster_map_is_canonical(layer.helix_cluster_map, n_clusters, cluster_width)) {
+        return false;
+    }
+    return helix_gate_up_exps_is_valid(layer.helix_ffn_gate_exps, cluster_width, n_embd, n_clusters)
+        && helix_gate_up_exps_is_valid(layer.helix_ffn_up_exps, cluster_width, n_embd, n_clusters)
+        && helix_down_exps_is_valid(layer.helix_ffn_down_exps, cluster_width, n_embd, n_clusters);
+}
+
+static void helix_disable_layer_routing(llama_layer & layer) {
+    layer.helix_router_gate = nullptr;
+    layer.helix_cluster_map = nullptr;
+    layer.helix_ffn_gate_exps = nullptr;
+    layer.helix_ffn_up_exps   = nullptr;
+    layer.helix_ffn_down_exps = nullptr;
+}
+
+} // namespace
+
+void llama_model::validate_helix_layout() {
+    const int64_t n_embd = hparams.n_embd;
+    const int64_t n_ff   = hparams.n_ff();
+
+    for (int il = 0; il < hparams.n_layer; ++il) {
+        if (layers[il].helix_router_gate == nullptr && layers[il].helix_cluster_map == nullptr) {
+            continue;
+        }
+        if (!helix_layer_layout_is_valid(layers[il], n_embd, n_ff)) {
+            LLAMA_LOG_WARN(
+                "[HELIX] layer %d: cluster map is not canonical sorted layout (map[i] == i/cluster_width). "
+                "Disable sparse routing on this layer. Use embed_helix_into_gguf permuted GGUF; "
+                "do not pair unpermuted weights with raw spectral sidecar labels.\n",
+                il);
+            helix_disable_layer_routing(layers[il]);
+        } else if (std::getenv("HELIX_TRACE")) {
+            LLAMA_LOG_INFO("[HELIX] layer %d: sparse routing enabled (gate=%p map=%p)\n",
+                    il, (void *) layers[il].helix_router_gate, (void *) layers[il].helix_cluster_map);
+        }
+    }
+}
+
+void llama_model::load_helix_sidecar(const std::string & filename) {
+    if (filename.empty()) {
+        return;
+    }
+
+    std::ifstream sidecar(filename, std::ios::binary);
+    if (!sidecar.is_open()) {
+        LLAMA_LOG_WARN("[HELIX] Warning: Sidecar metadata file not found: %s\n", filename.c_str());
+        return;
+    }
+
+    ggml_backend_buffer_type_t buft = nullptr;
+    if (!pimpl->cpu_buft_list.empty()) {
+        buft = pimpl->cpu_buft_list.front().second;
+    } else {
+        ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        if (cpu_dev != nullptr) {
+            buft = ggml_backend_dev_buffer_type(cpu_dev);
+        }
+    }
+
+    if (buft == nullptr) {
+        LLAMA_LOG_WARN("[HELIX] Warning: no CPU buffer type available for sidecar load\n");
+        return;
+    }
+
+    const int n_layer = hparams.n_layer;
+    if (n_layer <= 0 || (int) layers.size() < n_layer) {
+        LLAMA_LOG_WARN("[HELIX] Warning: model has no layers for sidecar load\n");
+        return;
+    }
+
+    LLAMA_LOG_INFO("%s: loading Helix sidecar metadata from %s (%d layers)\n", __func__, filename.c_str(), n_layer);
+
+    for (int il = 0; il < n_layer; ++il) {
+        int32_t num_clusters = 0;
+        int32_t hidden_dim   = 0;
+
+        if (!helix_read_i32(sidecar, num_clusters) || !helix_read_i32(sidecar, hidden_dim)) {
+            LLAMA_LOG_WARN("[HELIX] Warning: truncated sidecar header at layer %d\n", il);
+            return;
+        }
+
+        if (num_clusters <= 0 || hidden_dim <= 0) {
+            LLAMA_LOG_WARN("[HELIX] Warning: invalid gate descriptor at layer %d (clusters=%d, hidden=%d)\n",
+                    il, num_clusters, hidden_dim);
+            return;
+        }
+
+        if ((int64_t) hidden_dim != hparams.n_embd) {
+            LLAMA_LOG_WARN("[HELIX] Warning: hidden_dim mismatch at layer %d (sidecar=%d, model=%d)\n",
+                    il, hidden_dim, (int) hparams.n_embd);
+            return;
+        }
+
+        ggml_init_params gate_params {
+            /*.mem_size   =*/ ggml_tensor_overhead() + 256,
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+
+        ggml_context_ptr gate_ctx { ggml_init(gate_params) };
+        if (!gate_ctx) {
+            LLAMA_LOG_WARN("[HELIX] Warning: failed to create gate context at layer %d\n", il);
+            return;
+        }
+
+        // gates.pt row-major [num_clusters, hidden_dim] maps to ggml ne[0]=hidden_dim, ne[1]=num_clusters:
+        // offset(cluster, hidden) = cluster * hidden_dim + hidden  (same as ggml i1*ne[0]+i0)
+        ggml_tensor * gate = ggml_new_tensor_2d(gate_ctx.get(), GGML_TYPE_F16, hidden_dim, num_clusters);
+        {
+            const std::string gate_name = "helix_sidecar.blk." + std::to_string(il) + ".gate";
+            ggml_set_name(gate, gate_name.c_str());
+        }
+
+        ggml_backend_buffer_ptr gate_buf { ggml_backend_alloc_ctx_tensors_from_buft(gate_ctx.get(), buft) };
+        if (!gate_buf) {
+            LLAMA_LOG_WARN("[HELIX] Warning: failed to allocate gate buffer at layer %d\n", il);
+            return;
+        }
+        ggml_backend_buffer_set_usage(gate_buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+        const size_t gate_bytes = ggml_nbytes(gate);
+        if (gate_bytes != (size_t) num_clusters * (size_t) hidden_dim * sizeof(uint16_t)) {
+            LLAMA_LOG_WARN("[HELIX] Warning: gate tensor capacity mismatch at layer %d\n", il);
+            return;
+        }
+
+        if (!helix_read_tensor_payload(sidecar, gate, gate_bytes)) {
+            LLAMA_LOG_WARN("[HELIX] Warning: failed to read gate payload at layer %d\n", il);
+            return;
+        }
+
+        int32_t map_elements = 0;
+        if (!helix_read_i32(sidecar, map_elements)) {
+            LLAMA_LOG_WARN("[HELIX] Warning: truncated cluster-map header at layer %d\n", il);
+            return;
+        }
+
+        if (map_elements <= 0) {
+            LLAMA_LOG_WARN("[HELIX] Warning: invalid cluster-map descriptor at layer %d (elements=%d)\n",
+                    il, map_elements);
+            return;
+        }
+
+        ggml_init_params map_params {
+            /*.mem_size   =*/ ggml_tensor_overhead() + 256,
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+
+        ggml_context_ptr map_ctx { ggml_init(map_params) };
+        if (!map_ctx) {
+            LLAMA_LOG_WARN("[HELIX] Warning: failed to create cluster-map context at layer %d\n", il);
+            return;
+        }
+
+        ggml_tensor * cluster_map = ggml_new_tensor_1d(map_ctx.get(), GGML_TYPE_I32, map_elements);
+        {
+            const std::string map_name = "helix_sidecar.blk." + std::to_string(il) + ".cluster_map";
+            ggml_set_name(cluster_map, map_name.c_str());
+        }
+
+        ggml_backend_buffer_ptr map_buf { ggml_backend_alloc_ctx_tensors_from_buft(map_ctx.get(), buft) };
+        if (!map_buf) {
+            LLAMA_LOG_WARN("[HELIX] Warning: failed to allocate cluster-map buffer at layer %d\n", il);
+            return;
+        }
+        ggml_backend_buffer_set_usage(map_buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+        const size_t map_bytes = ggml_nbytes(cluster_map);
+        if (map_bytes != (size_t) map_elements * sizeof(int32_t)) {
+            LLAMA_LOG_WARN("[HELIX] Warning: cluster-map tensor capacity mismatch at layer %d\n", il);
+            return;
+        }
+
+        if (!helix_read_tensor_payload(sidecar, cluster_map, map_bytes)) {
+            LLAMA_LOG_WARN("[HELIX] Warning: failed to read cluster-map payload at layer %d\n", il);
+            return;
+        }
+
+        layers[il].helix_router_gate = gate;
+        layers[il].helix_cluster_map = cluster_map;
+
+        if (!helix_layer_layout_is_valid(layers[il], hparams.n_embd, hparams.n_ff())) {
+            LLAMA_LOG_WARN(
+                "[HELIX] layer %d: sidecar cluster map is not canonical; disabling sparse routing. "
+                "Regenerate helix_metadata.bin with make_helix_sidecar.py (sorted labels).\n",
+                il);
+            helix_disable_layer_routing(layers[il]);
+        }
+
+        pimpl->helix_sidecar_ctxs_bufs.emplace_back(std::move(gate_ctx), std::move(gate_buf));
+        pimpl->helix_sidecar_ctxs_bufs.emplace_back(std::move(map_ctx), std::move(map_buf));
+
+        LLAMA_LOG_DEBUG("%s: layer %3d loaded sidecar gate [%d x %d], cluster map [%d]\n",
+                __func__, il, hidden_dim, num_clusters, map_elements);
+    }
+
+    LLAMA_LOG_INFO("%s: Helix sidecar metadata loaded successfully\n", __func__);
+}
+
+void llama_model_load_helix_sidecar(const std::string & filename, llama_model & model) {
+    model.load_helix_sidecar(filename);
+}
+
 ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     const buft_list_t * buft_list_layer = tn.bid == -1 ? nullptr : pimpl->dev_layer.at(tn.bid).buft_list;
     return ml.create_tensor(
         hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer,
         tn, ne, flags);
+}
+
+ggml_tensor * llama_model_base::create_tensor_cpu(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
+    return ml.create_tensor(
+        hparams, &pimpl->cpu_buft_list, &pimpl->cpu_buft_list, &pimpl->cpu_buft_list, &pimpl->cpu_buft_list,
+        tn, ne, flags);
+}
+
+ggml_tensor * llama_model_base::create_tensor_cpu(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
+    GGML_ASSERT(ml != nullptr);
+    return create_tensor_cpu(*ml, tn, ne, flags);
 }
 
 std::string llama_model::arch_name() const {
@@ -2169,6 +2495,7 @@ llama_model_params llama_model_default_params() {
         /*.use_extra_bufts             =*/ true,
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
+        /*.helix_sidecar_path          =*/ nullptr,
     };
 
     return result;

@@ -1,5 +1,62 @@
 #include "models.h"
 
+#include <cstdlib>
+#include <cstdio>
+
+namespace {
+
+ggml_tensor * load_helix_tensor_opt(
+        llama_model_qwen3 & model,
+        llama_model_loader & ml,
+        llm_tensor         tensor,
+        int                layer) {
+    const LLM_TN_IMPL tn(model.model->arch, tensor, "weight", layer, 0);
+    const char * name = tn.str().c_str();
+    const ggml_tensor * meta = ml.get_tensor_meta(name);
+    if (meta == nullptr) {
+        if (std::getenv("HELIX_TRACE")) {
+            fprintf(stderr, "[HELIX TRACE LOAD] missing tensor meta: %s\n", name);
+        }
+        return nullptr;
+    }
+
+    int rank = GGML_MAX_DIMS;
+    while (rank > 1 && meta->ne[rank - 1] == 1) {
+        --rank;
+    }
+
+    ggml_tensor * out = nullptr;
+    switch (rank) {
+        case 1:
+            out = model.create_tensor_cpu(tn, { meta->ne[0] }, llama_model_loader::TENSOR_NOT_REQUIRED);
+            break;
+        case 2:
+            out = model.create_tensor_cpu(tn, { meta->ne[0], meta->ne[1] }, llama_model_loader::TENSOR_NOT_REQUIRED);
+            break;
+        case 3:
+            out = model.create_tensor_cpu(tn, { meta->ne[0], meta->ne[1], meta->ne[2] }, llama_model_loader::TENSOR_NOT_REQUIRED);
+            break;
+        default:
+            out = model.create_tensor_cpu(tn, { meta->ne[0], meta->ne[1], meta->ne[2], meta->ne[3] },
+                    llama_model_loader::TENSOR_NOT_REQUIRED);
+            break;
+    }
+
+    if (out == nullptr) {
+        LLAMA_LOG_WARN("%s: failed to bind Helix tensor %s (type=%s ne=[%lld,%lld,%lld,%lld])\n",
+                __func__, name, ggml_type_name(meta->type),
+                (long long) meta->ne[0], (long long) meta->ne[1],
+                (long long) meta->ne[2], (long long) meta->ne[3]);
+        if (std::getenv("HELIX_TRACE")) {
+            fprintf(stderr, "[HELIX TRACE LOAD] create_tensor failed: %s ne=[%lld,%lld]\n",
+                    name, (long long) meta->ne[0], (long long) meta->ne[1]);
+        }
+    }
+    return out;
+}
+
+} // namespace
+
 void llama_model_qwen3::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
     switch (hparams.n_layer) {
@@ -11,7 +68,7 @@ void llama_model_qwen3::load_arch_hparams(llama_model_loader & ml) {
     }
 }
 
-void llama_model_qwen3::load_arch_tensors(llama_model_loader &) {
+void llama_model_qwen3::load_arch_tensors(llama_model_loader & ml) {
     LLAMA_LOAD_LOCALS;
 
     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
@@ -42,6 +99,28 @@ void llama_model_qwen3::load_arch_tensors(llama_model_loader &) {
         layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff}, 0);
         layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {  n_ff, n_embd}, 0);
         layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff}, 0);
+
+        layer.helix_router_gate = load_helix_tensor_opt(*this, ml, LLM_TENSOR_HELIX_ROUTER_GATE, i);
+        layer.helix_cluster_map = load_helix_tensor_opt(*this, ml, LLM_TENSOR_HELIX_CLUSTER_MAP, i);
+        layer.helix_ffn_gate_exps = load_helix_tensor_opt(*this, ml, LLM_TENSOR_HELIX_FFN_GATE_EXPS, i);
+        layer.helix_ffn_up_exps   = load_helix_tensor_opt(*this, ml, LLM_TENSOR_HELIX_FFN_UP_EXPS, i);
+        layer.helix_ffn_down_exps = load_helix_tensor_opt(*this, ml, LLM_TENSOR_HELIX_FFN_DOWN_EXPS, i);
+        layer.helix_shared_core_gate = load_helix_tensor_opt(*this, ml, LLM_TENSOR_HELIX_SHARED_CORE_GATE, i);
+        layer.helix_shared_core_up   = load_helix_tensor_opt(*this, ml, LLM_TENSOR_HELIX_SHARED_CORE_UP, i);
+        layer.helix_shared_core_down = load_helix_tensor_opt(*this, ml, LLM_TENSOR_HELIX_SHARED_CORE_DOWN, i);
+        layer.helix_magnet_a = load_helix_tensor_opt(*this, ml, LLM_TENSOR_HELIX_MAGNET_A, i);
+        layer.helix_magnet_b = load_helix_tensor_opt(*this, ml, LLM_TENSOR_HELIX_MAGNET_B, i);
+    }
+
+    if (std::getenv("HELIX_DOPPELGANGER") != nullptr) {
+        int n_magnet_layers = 0;
+        for (int i = 0; i < n_layer; ++i) {
+            if (layers[i].helix_magnet_a != nullptr && layers[i].helix_magnet_b != nullptr) {
+                ++n_magnet_layers;
+            }
+        }
+        LLAMA_LOG_INFO("%s: HELIX_DOPPELGANGER — magnet tensors on %d / %d layers\n",
+                __func__, n_magnet_layers, n_layer);
     }
 }
 
@@ -126,7 +205,17 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
                 model.layers[il].ffn_gate, NULL, model.layers[il].ffn_gate_s,
                 model.layers[il].ffn_down, NULL, model.layers[il].ffn_down_s,
                 NULL,
-                LLM_FFN_SILU, LLM_FFN_PAR, il);
+                LLM_FFN_SILU, LLM_FFN_PAR, il,
+                model.layers[il].helix_router_gate,
+                model.layers[il].helix_cluster_map,
+                model.layers[il].helix_ffn_gate_exps,
+                model.layers[il].helix_ffn_up_exps,
+                model.layers[il].helix_ffn_down_exps,
+                model.layers[il].helix_shared_core_gate,
+                model.layers[il].helix_shared_core_up,
+                model.layers[il].helix_shared_core_down,
+                model.layers[il].helix_magnet_a,
+                model.layers[il].helix_magnet_b);
         cb(cur, "ffn_out", il);
 
         cur = ggml_add(ctx0, cur, ffn_inp);
