@@ -658,16 +658,18 @@ int llama_cli(int argc, char ** argv) {
                     const bool mask_applied = std::getenv("HELIX_MAGNET_APPLY_MASK") != nullptr;
                     if (st.n_magnet_layers > 0) {
                         if (st.active_neuron_measured) {
+                            const bool paged = std::getenv("HELIX_MAGNET_PAGED") != nullptr;
                             console::log(
-                                "[ Helix Magnet: %d magnet + %d dense | FFN %s ]\n",
-                                st.n_magnet_layers, st.n_dense_layers, ffn_mode);
+                                "[ Helix Magnet: %d magnet + %d dense | FFN %s%s ]\n",
+                                st.n_magnet_layers, st.n_dense_layers, ffn_mode,
+                                paged ? " + paged" : "");
                             if (st.decode_total_neurons > 0) {
+                                const uint64_t skipped = st.decode_total_neurons - st.decode_active_neurons;
                                 console::log(
-                                    "[ Neurons: %llu / %llu active (%.1f%% decode) | Budget: %.0f%% ]\n",
+                                    "[ Neurons: %llu loaded, %llu skipped (%.1f%% active) ]\n",
                                     (unsigned long long) st.decode_active_neurons,
-                                    (unsigned long long) st.decode_total_neurons,
-                                    st.active_neuron_decode_pct,
-                                    st.active_budget_pct);
+                                    (unsigned long long) skipped,
+                                    st.active_neuron_decode_pct);
                             } else {
                                 console::log(
                                     "[ Neurons: %.1f%% active (measured) | Budget: %.0f%% ]\n",
