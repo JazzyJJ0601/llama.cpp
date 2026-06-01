@@ -59,18 +59,21 @@ int64_t helix_magnet_k_max(int64_t n_ff) {
 
 struct ggml_tensor * helix_graph_paged_pack_rows(
         ggml_context * ctx0,
-        ggml_tensor * weight_3d,
-        ggml_tensor * selected,
-        ggml_tensor * live_3d,
+        ggml_tensor * weight_2d,
+        ggml_tensor * selected_1d,
+        ggml_tensor * live_2d,
         const int64_t  gather_k) {
-    GGML_ASSERT(weight_3d != nullptr && selected != nullptr && live_3d != nullptr);
-    GGML_ASSERT(gather_k >= 1 && gather_k <= live_3d->ne[2]);
+    GGML_ASSERT(weight_2d != nullptr && selected_1d != nullptr && live_2d != nullptr);
+    GGML_ASSERT(gather_k >= 1);
 
-    ggml_tensor * rows = ggml_get_rows(ctx0, weight_3d, selected);
+    // get_rows on 2D [ne0, n_rows] with 1D indices [gather_k] selects
+    // gather_k rows → output is [ne0, gather_k] in F32.
+    ggml_tensor * rows = ggml_get_rows(ctx0, weight_2d, selected_1d);
 
-    const int64_t n0 = live_3d->ne[0];
-    ggml_tensor * live_view = ggml_view_3d(
-            ctx0, live_3d, n0, 1, gather_k, live_3d->nb[0], live_3d->nb[1], 0);
+    // Copy gathered rows into the GPU live buffer (may convert F32→F16).
+    ggml_tensor * live_view = ggml_view_2d(
+            ctx0, live_2d, live_2d->ne[0], gather_k,
+            live_2d->nb[1], 0);
 
     return ggml_cpy(ctx0, rows, live_view);
 }
@@ -328,7 +331,7 @@ bool llama_model_init_helix_paging_buffers(llama_model & model) {
         layer.helix_ffn_up_live = ggml_new_tensor_2d(
                 g_helix_paging.ctx.get(), GGML_TYPE_F16, p.n_embd, p.k_max);
         layer.helix_ffn_down_live = ggml_new_tensor_2d(
-                g_helix_paging.ctx.get(), GGML_TYPE_F16, p.k_max, p.n_embd);
+                g_helix_paging.ctx.get(), GGML_TYPE_F16, p.n_embd, p.k_max);
 
         for (ggml_tensor * t : { layer.helix_ffn_gate_live, layer.helix_ffn_up_live, layer.helix_ffn_down_live }) {
             ggml_set_name(t, "helix_ffn_live");

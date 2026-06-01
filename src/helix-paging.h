@@ -14,12 +14,13 @@ void llama_model_free_helix_paging_buffers(struct llama_model & model);
 
 int64_t helix_magnet_k_max(int64_t n_ff);
 
-// Pack magnet-selected rows from CPU weight [n0,1,n_src] into GPU live [n0,1,k_max].
+// Pack magnet-selected rows from CPU weight [n0, n_rows] into GPU live [n0, k_max].
+// selected_1d is a 1D I32 tensor of gather_k indices.
 struct ggml_tensor * helix_graph_paged_pack_rows(
         struct ggml_context * ctx0,
-        struct ggml_tensor * weight_3d,
-        struct ggml_tensor * selected,
-        struct ggml_tensor * live_3d,
+        struct ggml_tensor * weight_2d,
+        struct ggml_tensor * selected_1d,
+        struct ggml_tensor * live_2d,
         int64_t                gather_k);
 
 struct ggml_tensor * helix_graph_seq_indices(
