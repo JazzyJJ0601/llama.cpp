@@ -69,14 +69,8 @@ static ggml_tensor * helix_sparsity_anchor_tensor(
         ggml_context * ctx0,
         ggml_tensor * out,
         ggml_tensor * dep) {
-    if (out == nullptr || dep == nullptr) {
-        return out;
-    }
-    ggml_tensor * zero = ggml_scale(ctx0, ggml_sum(ctx0, dep), 0.0f);
-    if (zero->type != out->type) {
-        zero = ggml_cast(ctx0, zero, out->type);
-    }
-    return ggml_add(ctx0, out, ggml_repeat(ctx0, zero, out));
+    (void) ctx0; (void) dep;
+    return out;
 }
 
 static helix_sparsity_runtime g_helix_sparsity;
