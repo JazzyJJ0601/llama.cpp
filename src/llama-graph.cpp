@@ -246,6 +246,18 @@ bool helix_sparsity_get(struct helix_sparsity_stats * out) {
     }
     out->vram_saved_mib = vram_saved / (1024.0 * 1024.0);
 
+    // Delta neuron cache stats
+    helix_cache_stats cst {};
+    if (helix_neuron_cache_get_stats(&cst)) {
+        out->cache_hit_rate_pct  = cst.hit_rate_pct;
+        out->cache_rows_fetched  = cst.total_fetched;
+        out->cache_rows_hit      = cst.total_hits;
+    } else {
+        out->cache_hit_rate_pct  = 0.0;
+        out->cache_rows_fetched  = 0;
+        out->cache_rows_hit      = 0;
+    }
+
     return engine_active;
 }
 
@@ -2372,6 +2384,17 @@ bool helix_runtime_cb_eval(ggml_tensor * t, bool ask, void * user_data) {
                         g_helix_sparsity.decode_active += (uint64_t) k_sel;
                         g_helix_sparsity.decode_total  += (uint64_t) n_ff;
                         ++g_helix_sparsity.decode_mask_samples;
+
+                        // Feed selected indices to the delta neuron cache
+                        if (helix_magnet_paged_enabled() && il >= 0) {
+                            std::vector<int32_t> idx_buf((size_t) k_sel);
+                            if (t->data != nullptr) {
+                                memcpy(idx_buf.data(), t->data, (size_t) k_sel * sizeof(int32_t));
+                            } else {
+                                ggml_backend_tensor_get(t, idx_buf.data(), 0, (size_t) k_sel * sizeof(int32_t));
+                            }
+                            helix_neuron_cache_update(helix_get_neuron_cache(), il, idx_buf.data(), k_sel);
+                        }
                     }
                     g_helix_sparsity.layer_magnet[il] = true;
                 }

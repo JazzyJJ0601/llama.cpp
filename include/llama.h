@@ -1592,6 +1592,9 @@ extern "C" {
         uint64_t decode_active_neurons; // absolute active neuron count (decode tokens)
         uint64_t decode_total_neurons;  // absolute total neuron count (decode tokens)
         double  vram_saved_mib;         // estimated VRAM saved by sparsity (MiB)
+        double  cache_hit_rate_pct;     // delta neuron cache hit rate (0 if cache inactive)
+        uint64_t cache_rows_fetched;    // cumulative rows transferred from CPU
+        uint64_t cache_rows_hit;        // cumulative rows that were already cached
     };
 
     LLAMA_API void llama_helix_sparsity_reset(void);

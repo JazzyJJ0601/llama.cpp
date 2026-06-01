@@ -678,6 +678,13 @@ int llama_cli(int argc, char ** argv) {
                             console::log(
                                 "[ VRAM saved: ~%.0f MiB | ~%.0f%% FFN FLOPs saved ]\n",
                                 st.vram_saved_mib, st.ffn_flop_saved_pct);
+                            if (st.cache_rows_fetched > 0 || st.cache_rows_hit > 0) {
+                                console::log(
+                                    "[ Cache: %.1f%% hit rate | %llu fetched, %llu cached ]\n",
+                                    st.cache_hit_rate_pct,
+                                    (unsigned long long) st.cache_rows_fetched,
+                                    (unsigned long long) st.cache_rows_hit);
+                            }
                         } else {
                             console::log(
                                 "[ Helix Magnet: %d magnet + %d dense | (no live mask samples — rebuild llama-cli) "

@@ -80,6 +80,140 @@ struct ggml_tensor * helix_graph_seq_indices(
     return ggml_repeat(ctx0, id_i32, tmpl);
 }
 
+// --- Delta neuron cache ---------------------------------------------------
+
+static helix_neuron_cache g_neuron_cache;
+
+helix_neuron_cache & helix_get_neuron_cache(void) {
+    return g_neuron_cache;
+}
+
+void helix_neuron_cache_init(helix_neuron_cache & cache, int n_layer, int64_t k_max) {
+    cache.layers.resize((size_t) n_layer);
+    for (int il = 0; il < n_layer; ++il) {
+        auto & lc = cache.layers[il];
+        lc.k_max = k_max;
+        lc.indices.assign((size_t) k_max, -1);
+        lc.warm = false;
+    }
+    helix_neuron_cache_reset_stats(cache);
+}
+
+void helix_neuron_cache_reset_stats(helix_neuron_cache & cache) {
+    cache.total_fetched = 0;
+    cache.total_hits    = 0;
+    cache.total_updates = 0;
+}
+
+helix_cache_delta helix_neuron_cache_update(
+        helix_neuron_cache & cache,
+        int                  il,
+        const int32_t      * new_indices,
+        int64_t              gather_k) {
+    helix_cache_delta delta;
+    delta.n_hits = 0;
+    delta.n_miss = 0;
+
+    if (il < 0 || il >= (int) cache.layers.size()) {
+        // Layer not cached — fetch everything
+        delta.fetch_indices.resize((size_t) gather_k);
+        delta.fetch_slots.resize((size_t) gather_k);
+        for (int64_t i = 0; i < gather_k; ++i) {
+            delta.fetch_indices[i] = new_indices[i];
+            delta.fetch_slots[i]   = (int32_t) i;
+        }
+        delta.n_miss = gather_k;
+        return delta;
+    }
+
+    auto & lc = cache.layers[il];
+
+    if (!lc.warm) {
+        // First token — cache cold, fetch everything
+        delta.fetch_indices.resize((size_t) gather_k);
+        delta.fetch_slots.resize((size_t) gather_k);
+        for (int64_t i = 0; i < gather_k; ++i) {
+            delta.fetch_indices[i] = new_indices[i];
+            delta.fetch_slots[i]   = (int32_t) i;
+        }
+        delta.n_miss = gather_k;
+
+        // Store new state
+        for (int64_t i = 0; i < gather_k; ++i) {
+            lc.indices[i] = new_indices[i];
+        }
+        for (int64_t i = gather_k; i < lc.k_max; ++i) {
+            lc.indices[i] = -1;
+        }
+        lc.warm = true;
+
+        cache.total_fetched += (uint64_t) gather_k;
+        cache.total_updates++;
+        return delta;
+    }
+
+    // Build lookup of what's currently cached: index → slot
+    // Use a simple linear scan since k_max is small (~1350)
+    std::vector<bool> new_needed((size_t) gather_k, true);
+    std::vector<bool> old_keep(lc.indices.size(), false);
+
+    for (int64_t i = 0; i < gather_k; ++i) {
+        const int32_t want = new_indices[i];
+        for (int64_t j = 0; j < lc.k_max; ++j) {
+            if (lc.indices[j] == want) {
+                // Cache hit — this neuron is already in slot j
+                new_needed[i] = false;
+                old_keep[j] = true;
+                delta.n_hits++;
+                break;
+            }
+        }
+    }
+
+    // Collect free slots (evicted neurons)
+    std::vector<int32_t> free_slots;
+    for (int64_t j = 0; j < lc.k_max; ++j) {
+        if (!old_keep[j]) {
+            free_slots.push_back((int32_t) j);
+        }
+    }
+
+    // Assign new neurons to free slots
+    size_t free_idx = 0;
+    for (int64_t i = 0; i < gather_k; ++i) {
+        if (new_needed[i]) {
+            int32_t slot = (free_idx < free_slots.size())
+                ? free_slots[free_idx++]
+                : (int32_t) i;  // fallback
+            delta.fetch_indices.push_back(new_indices[i]);
+            delta.fetch_slots.push_back(slot);
+            lc.indices[slot] = new_indices[i];
+            delta.n_miss++;
+        }
+    }
+
+    cache.total_fetched += (uint64_t) delta.n_miss;
+    cache.total_hits    += (uint64_t) delta.n_hits;
+    cache.total_updates++;
+
+    return delta;
+}
+
+bool helix_neuron_cache_get_stats(helix_cache_stats * out) {
+    if (out == nullptr) {
+        return false;
+    }
+    const auto & c = g_neuron_cache;
+    out->total_fetched = c.total_fetched;
+    out->total_hits    = c.total_hits;
+    out->total_updates = c.total_updates;
+    const uint64_t total = c.total_fetched + c.total_hits;
+    out->hit_rate_pct = total > 0 ? 100.0 * (double) c.total_hits / (double) total : 0.0;
+    return c.total_updates > 0;
+}
+
+// --- Paging pool ----------------------------------------------------------
+
 struct llama_helix_paging_pool {
     ggml_context_ptr          ctx;
     ggml_backend_buffer_ptr   buf;
@@ -186,11 +320,15 @@ bool llama_model_init_helix_paging_buffers(llama_model & model) {
 
     g_helix_paging.ready = true;
 
+    // Initialize the delta neuron cache
+    const int64_t cache_k_max = plans.empty() ? 0 : plans[0].k_max;
+    helix_neuron_cache_init(g_neuron_cache, n_layer, cache_k_max);
+
     const char * dev_name = dev ? ggml_backend_dev_name(dev) : "host";
     const size_t buf_bytes = ggml_backend_buffer_get_size(g_helix_paging.buf.get());
     LLAMA_LOG_INFO(
             "%s: HELIX_MAGNET_PAGED — %zu layer scratchpads, k_max<=25%% n_ff, "
-            "%.2f MiB on %s (get_rows+copy per forward)\n",
+            "%.2f MiB on %s (delta neuron cache enabled)\n",
             __func__, plans.size(),
             (double) (buf_bytes / 1024.0 / 1024.0), dev_name);
 
