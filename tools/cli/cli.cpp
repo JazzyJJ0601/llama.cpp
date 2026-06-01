@@ -647,40 +647,19 @@ int llama_cli(int argc, char ** argv) {
         if (params.show_timings) {
             console::set_display(DISPLAY_TYPE_INFO);
             console::log("\n");
-            console::log("[ Prompt: %.1f t/s | Generation: %.1f t/s ]\n",
-                timings.prompt_per_second, timings.predicted_per_second);
+            helix_sparsity_stats st {};
+            llama_helix_sparsity_get(&st);
 
-            if (std::getenv("HELIX_DOPPELGANGER")) {
-                helix_sparsity_stats st {};
-                helix_profile_stats  prof {};
-                llama_helix_sparsity_get(&st);
-                const bool has_prof = llama_helix_profile_get(&prof);
-
-                if (st.decode_total_neurons > 0) {
-                    const uint64_t skipped = st.decode_total_neurons - st.decode_active_neurons;
-                    console::log("[ Neurons: %llu loaded, %llu skipped (%.1f%% active) | VRAM saved: ~%.0f MiB ]\n",
-                        (unsigned long long) st.decode_active_neurons,
-                        (unsigned long long) skipped,
-                        st.active_neuron_decode_pct,
-                        st.vram_saved_mib);
-                } else if (st.active_neuron_measured) {
-                    console::log("[ Neurons: %.1f%% active | VRAM saved: ~%.0f MiB ]\n",
-                        st.active_neuron_pct, st.vram_saved_mib);
-                }
-
-                if (has_prof) {
-                    console::log("[ Profile: %d tokens | mean %.1f%% | min %.1f%% | p50 %.1f%% | p95 %.1f%% | max %.1f%% ]\n",
-                        prof.n_tokens, prof.mean_active_pct,
-                        prof.min_active_pct, prof.p50_active_pct,
-                        prof.p95_active_pct, prof.max_active_pct);
-                }
-
-                if (st.cache_rows_fetched > 0 || st.cache_rows_hit > 0) {
-                    console::log("[ Cache: %.1f%% hit | %llu fetched, %llu cached ]\n",
-                        st.cache_hit_rate_pct,
-                        (unsigned long long) st.cache_rows_fetched,
-                        (unsigned long long) st.cache_rows_hit);
-                }
+            if (st.engine_active && (st.n_magnet_layers > 0 || st.n_gate_layers > 0)) {
+                const double active_pct = st.decode_total_neurons > 0
+                    ? st.active_neuron_decode_pct
+                    : (st.active_neuron_measured ? st.active_neuron_pct : st.active_budget_pct);
+                console::log("[ Prompt: %.1f t/s | Generation: %.1f t/s | %.1f%% neurons active | ~%.0f MiB saved ]\n",
+                    timings.prompt_per_second, timings.predicted_per_second,
+                    active_pct, st.vram_saved_mib);
+            } else {
+                console::log("[ Prompt: %.1f t/s | Generation: %.1f t/s ]\n",
+                    timings.prompt_per_second, timings.predicted_per_second);
             }
             console::set_display(DISPLAY_TYPE_RESET);
         }
