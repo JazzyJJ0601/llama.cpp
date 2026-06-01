@@ -1608,13 +1608,11 @@ static bool helix_magnet_staged_enabled() {
 }
 
 static bool helix_magnet_sparse_mode_enabled() {
-    if (!helix_doppelganger_enabled()) {
-        return false;
-    }
     if (helix_env_flag_active("HELIX_MAGNET_DENSE")) {
         return false;
     }
-    return helix_env_flag_active("HELIX_MAGNET_SPARSE");
+    // Default to sparse when magnet tensors are present
+    return true;
 }
 
 static bool helix_magnet_row_gather_enabled() {
