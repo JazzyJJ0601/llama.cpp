@@ -888,7 +888,10 @@ struct llm_graph_context {
         ggml_tensor * helix_shared_core_up   = nullptr,
         ggml_tensor * helix_shared_core_down = nullptr,
         ggml_tensor * helix_magnet_a = nullptr,
-        ggml_tensor * helix_magnet_b = nullptr) const;
+        ggml_tensor * helix_magnet_b = nullptr,
+        ggml_tensor * helix_ffn_gate_live = nullptr,
+        ggml_tensor * helix_ffn_up_live   = nullptr,
+        ggml_tensor * helix_ffn_down_live = nullptr) const;
 
     ggml_tensor * build_ffn(
              ggml_tensor * cur,
@@ -914,7 +917,10 @@ struct llm_graph_context {
              ggml_tensor * helix_shared_core_up   = nullptr,
              ggml_tensor * helix_shared_core_down = nullptr,
              ggml_tensor * helix_magnet_a = nullptr,
-             ggml_tensor * helix_magnet_b = nullptr) const;
+             ggml_tensor * helix_magnet_b = nullptr,
+             ggml_tensor * helix_ffn_gate_live = nullptr,
+             ggml_tensor * helix_ffn_up_live   = nullptr,
+             ggml_tensor * helix_ffn_down_live = nullptr) const;
 
     // build MoE FFN without bias tensors
     ggml_tensor * build_moe_ffn(

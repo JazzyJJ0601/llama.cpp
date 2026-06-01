@@ -1034,8 +1034,24 @@ inline std::string llm_ffn_exps_block_regex(int idx) {
     return string_format("blk\\.%d%s", idx, LLM_FFN_EXPS_REGEX);
 }
 
+// Return the best available host buffer type: CUDA-pinned (DMA-capable) if a
+// GPU device is present, plain CPU otherwise.  Pinned memory lets ggml_cpy
+// transfer rows directly over PCIe without an intermediate staging copy.
+inline ggml_backend_buffer_type_t common_best_host_buft() {
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        auto * dev = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            auto * host_buft = ggml_backend_dev_host_buffer_type(dev);
+            if (host_buft) {
+                return host_buft;
+            }
+        }
+    }
+    return ggml_backend_cpu_buffer_type();
+}
+
 inline llama_model_tensor_buft_override llm_ffn_exps_cpu_override() {
-    return { LLM_FFN_EXPS_REGEX, ggml_backend_cpu_buffer_type() };
+    return { LLM_FFN_EXPS_REGEX, common_best_host_buft() };
 }
 
 //

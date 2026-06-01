@@ -215,7 +215,10 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
                 model.layers[il].helix_shared_core_up,
                 model.layers[il].helix_shared_core_down,
                 model.layers[il].helix_magnet_a,
-                model.layers[il].helix_magnet_b);
+                model.layers[il].helix_magnet_b,
+                model.layers[il].helix_ffn_gate_live,
+                model.layers[il].helix_ffn_up_live,
+                model.layers[il].helix_ffn_down_live);
         cb(cur, "ffn_out", il);
 
         cur = ggml_add(ctx0, cur, ffn_inp);

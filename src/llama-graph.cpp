@@ -1,5 +1,7 @@
 #include "llama-graph.h"
 
+#include "helix-paging.h"
+
 #include "llama.h"
 #include "llama-impl.h"
 #include "llama-model.h"
@@ -1476,14 +1478,28 @@ static bool helix_doppelganger_enabled() {
     return helix_env_flag_active("HELIX_DOPPELGANGER");
 }
 
-static int64_t helix_magnet_active_k(int il, int64_t n_ff) {
+static float helix_magnet_layer_target_frac(int il) {
     const float frac_override = helix_magnet_env_width_frac();
-    float frac;
     if (frac_override > 0.0f && frac_override <= 1.0f) {
-        frac = frac_override;
-    } else {
-        frac = (il < 13) ? 0.25f : 0.20f;
+        return frac_override;
     }
+    const char * target = std::getenv("HELIX_MAGNET_TARGET_FRAC");
+    if (target != nullptr && target[0] != '\0') {
+        const float f = (float) atof(target);
+        if (f > 0.0f && f <= 1.0f) {
+            return f;
+        }
+    }
+    return (il < 13) ? 0.25f : 0.20f;
+}
+
+static float helix_magnet_threshold_scale(int il) {
+    // Calibrated so mean(|magnet|) * scale ≈ target active fraction (see train_magnet_field).
+    return 0.68f * helix_magnet_layer_target_frac(il) / 0.22f;
+}
+
+static int64_t helix_magnet_active_k(int il, int64_t n_ff) {
+    const float frac = helix_magnet_layer_target_frac(il);
     int64_t k = (int64_t) (frac * (float) n_ff + 0.5f);
     if (k < 1) {
         k = 1;
@@ -1491,7 +1507,29 @@ static int64_t helix_magnet_active_k(int il, int64_t n_ff) {
     if (k > n_ff) {
         k = n_ff;
     }
+    const char * vmin = std::getenv("HELIX_MAGNET_MIN_FRAC");
+    const char * vmax = std::getenv("HELIX_MAGNET_MAX_FRAC");
+    if (vmin != nullptr && vmin[0] != '\0') {
+        const int64_t k_min = (int64_t) (atof(vmin) * (float) n_ff + 0.5f);
+        if (k < k_min) {
+            k = k_min;
+        }
+    }
+    if (vmax != nullptr && vmax[0] != '\0') {
+        const int64_t k_max = (int64_t) (atof(vmax) * (float) n_ff + 0.5f);
+        if (k > k_max) {
+            k = k_max;
+        }
+    }
     return k;
+}
+
+static bool helix_magnet_dynamic_enabled() {
+    return helix_env_flag_active("HELIX_MAGNET_DYNAMIC");
+}
+
+static bool helix_magnet_staged_enabled() {
+    return helix_env_flag_active("HELIX_MAGNET_STAGED");
 }
 
 static bool helix_magnet_sparse_mode_enabled() {
@@ -1505,8 +1543,15 @@ static bool helix_magnet_sparse_mode_enabled() {
 }
 
 static bool helix_magnet_row_gather_enabled() {
-    // Experimental physical row gather (mul_mat_id). Requires HELIX_MAGNET_SPARSE=1.
-    return helix_magnet_sparse_mode_enabled() && helix_env_flag_active("HELIX_MAGNET_GATHER");
+    if (!helix_magnet_sparse_mode_enabled()) {
+        return false;
+    }
+    return helix_env_flag_active("HELIX_MAGNET_GATHER") || helix_magnet_staged_enabled();
+}
+
+// Phase 2 demand paging: CPU-backed FFN + async row gather into VRAM scratchpad (see HELIX_DOPPELGANGER_PAGING.md).
+static bool helix_magnet_paged_enabled() {
+    return helix_doppelganger_enabled() && helix_env_flag_active("HELIX_MAGNET_PAGED");
 }
 
 static ggml_tensor * helix_sum_dim1_rows(
@@ -1518,6 +1563,41 @@ static ggml_tensor * helix_sum_dim1_rows(
     ggml_tensor * perm = ggml_cont(ctx0, ggml_permute(ctx0, down_out, 1, 0, 2, 3));
     ggml_tensor * sum  = ggml_sum_rows(ctx0, perm);
     return ggml_cont(ctx0, ggml_reshape_2d(ctx0, sum, n_embd_cur, n_ffn_tokens));
+}
+
+// Variable-width mask from magnet |scores| (per forward pass — ~8% on easy prompts, ~20% on hard).
+static ggml_tensor * helix_magnet_build_dynamic_mask(
+        ggml_context * ctx0,
+        ggml_tensor * scores,
+        int           il) {
+    const float scale = helix_magnet_threshold_scale(il);
+    ggml_tensor * scores_abs  = ggml_abs(ctx0, scores);
+    ggml_tensor * scores_mean = ggml_mean(ctx0, scores_abs);
+    ggml_tensor * thresh      = ggml_scale(ctx0, ggml_repeat(ctx0, scores_mean, scores_abs), scale);
+    ggml_tensor * above       = ggml_sub(ctx0, scores_abs, thresh);
+    return ggml_step(ctx0, above);
+}
+
+// Binary mask [n_ff, n_tokens]: ~active_k rows on (score >= k-th largest per token).
+static ggml_tensor * helix_magnet_build_topk_mask(
+        ggml_context * ctx0,
+        ggml_tensor * scores,
+        int           active_k) {
+    GGML_ASSERT(active_k >= 1);
+
+    const int64_t n_ff     = scores->ne[0];
+    const int64_t n_tokens = scores->ne[1] > 0 ? scores->ne[1] : 1;
+
+    ggml_tensor * sorted = ggml_cont(ctx0, ggml_argsort_top_k(ctx0, scores, active_k));
+
+    ggml_tensor * scores_3d = ggml_reshape_3d(ctx0, scores, 1, n_ff, n_tokens);
+    ggml_tensor * top_scores = ggml_get_rows(ctx0, scores_3d, sorted);
+    // k-th largest score per token (last row of top-k score block)
+    const size_t kth_off = (size_t) (active_k - 1) * top_scores->nb[1];
+    ggml_tensor * kth_score = ggml_view_2d(ctx0, top_scores, 1, n_tokens, top_scores->nb[2], kth_off);
+    ggml_tensor * thresh = ggml_repeat(ctx0, kth_score, scores);
+    ggml_tensor * above = ggml_sub(ctx0, scores, thresh);
+    return ggml_step(ctx0, above);
 }
 
 // GGUF stores magnet A/B with reversed dims vs ggml_mul_mat (see embed_magnet_gguf.py ti_shape).
@@ -2436,7 +2516,10 @@ ggml_tensor * llm_graph_context::build_helix_dnpa_sparse_ffn(
         ggml_tensor * helix_shared_core_up,
         ggml_tensor * helix_shared_core_down,
         ggml_tensor * helix_magnet_a,
-        ggml_tensor * helix_magnet_b) const {
+        ggml_tensor * helix_magnet_b,
+        ggml_tensor * helix_ffn_gate_live,
+        ggml_tensor * helix_ffn_up_live,
+        ggml_tensor * helix_ffn_down_live) const {
     // Force dense path for early layers — sparse sidecars not reliable for L0-2.
     if (il < 3) {
         if (!g_helix_stats.printed) g_helix_stats.layers_dense++;
@@ -2480,57 +2563,89 @@ ggml_tensor * llm_graph_context::build_helix_dnpa_sparse_ffn(
 
             const bool sparse_mode   = helix_magnet_sparse_mode_enabled();
             const bool sparse_gather = helix_magnet_row_gather_enabled();
+            const bool use_dynamic   = helix_magnet_dynamic_enabled();
             ggml_tensor * mg_out = nullptr;
 
             if (sparse_gather) {
-                // Top-K neuron indices from magnet scores; physical gather via mul_mat_id.
-                ggml_tensor * selected = ggml_top_k(ctx0, magnet_scores, (int) active_k);
+                // Magnet top-k indices; matmul only on k rows (weights stay mmap'd — not all rows computed).
+                const int64_t gather_k = helix_magnet_active_k(il, n_ff);
+                const int64_t k_max    = helix_magnet_k_max(n_ff);
+                // Dynamic + staged: rank by |score| (same threshold family as masked sparse).
+                ggml_tensor * scores_for_pick = use_dynamic
+                    ? ggml_abs(ctx0, magnet_scores)
+                    : magnet_scores;
+                ggml_tensor * selected = ggml_cont(ctx0, ggml_argsort_top_k(ctx0, scores_for_pick, (int) gather_k));
                 cb(selected, "magnet_topk", il);
 
                 const int64_t n_embd_cur = cur_f32_mg->ne[0];
                 const int64_t n_ffn_tokens = cur_f32_mg->ne[1];
                 ggml_tensor * cur_3d = ggml_reshape_3d(ctx0, cur_f32_mg, n_embd_cur, 1, n_ffn_tokens);
 
-                ggml_tensor * gate_as = ggml_reshape_3d(ctx0, ffn_gate, n_embd_cur, 1, n_ff);
-                ggml_tensor * up_as   = ggml_reshape_3d(ctx0, ffn_up,   n_embd_cur, 1, n_ff);
-                ggml_tensor * down_as = ggml_reshape_3d(ctx0, ffn_down, 1, n_embd_cur, n_ff);
+                const bool use_paged = helix_magnet_paged_enabled() &&
+                    helix_ffn_gate_live != nullptr && helix_ffn_up_live != nullptr &&
+                    helix_ffn_down_live != nullptr;
 
-                ggml_tensor * act_gate = build_lora_mm_id(gate_as, cur_3d, selected);
-                ggml_tensor * act_up   = build_lora_mm_id(up_as, cur_3d, selected);
+                ggml_tensor * gate_f32 = ggml_cont(ctx0, ggml_cast(ctx0, ffn_gate, GGML_TYPE_F32));
+                ggml_tensor * up_f32   = ggml_cont(ctx0, ggml_cast(ctx0, ffn_up,   GGML_TYPE_F32));
+                ggml_tensor * down_f32 = ggml_cont(ctx0, ggml_cast(ctx0, ffn_down, GGML_TYPE_F32));
+                ggml_tensor * gate_as = ggml_reshape_3d(ctx0, gate_f32, n_embd_cur, 1, n_ff);
+                ggml_tensor * up_as   = ggml_reshape_3d(ctx0, up_f32,   n_embd_cur, 1, n_ff);
+                ggml_tensor * down_as = ggml_reshape_3d(ctx0, down_f32, 1, n_embd_cur, n_ff);
+
+                ggml_tensor * gate_w = gate_as;
+                ggml_tensor * up_w   = up_as;
+                ggml_tensor * down_w = down_as;
+                ggml_tensor * mm_ids = selected;
+
+                if (use_paged) {
+                    ggml_tensor * gate_live_3d = ggml_reshape_3d(ctx0, helix_ffn_gate_live, n_embd_cur, 1, k_max);
+                    ggml_tensor * up_live_3d   = ggml_reshape_3d(ctx0, helix_ffn_up_live,   n_embd_cur, 1, k_max);
+                    ggml_tensor * down_live_3d = ggml_reshape_3d(ctx0, helix_ffn_down_live, 1, n_embd_cur, k_max);
+
+                    ggml_tensor * gate_packed = helix_graph_paged_pack_rows(ctx0, gate_as, selected, gate_live_3d, gather_k);
+                    ggml_tensor * up_packed   = helix_graph_paged_pack_rows(ctx0, up_as,   selected, up_live_3d,   gather_k);
+                    ggml_tensor * down_packed = helix_graph_paged_pack_rows(ctx0, down_as, selected, down_live_3d, gather_k);
+                    cb(gate_packed, "magnet_paged_gate", il);
+                    cb(up_packed, "magnet_paged_up", il);
+                    cb(down_packed, "magnet_paged_down", il);
+
+                    gate_w  = gate_live_3d;
+                    up_w    = up_live_3d;
+                    down_w  = down_live_3d;
+                    mm_ids  = helix_graph_seq_indices(ctx0, gather_k, n_ffn_tokens);
+                    cb(mm_ids, "magnet_paged_ids", il);
+                }
+
+                ggml_tensor * act_gate = build_lora_mm_id(gate_w, cur_3d, mm_ids);
+                ggml_tensor * act_up   = build_lora_mm_id(up_w, cur_3d, mm_ids);
                 cb(act_gate, "magnet_gate_sparse", il);
                 cb(act_up, "magnet_up_sparse", il);
 
-                ggml_tensor * gate_f32 = ggml_cont(ctx0, ggml_cast(ctx0, act_gate, GGML_TYPE_F32));
-                ggml_tensor * up_f32   = ggml_cont(ctx0, ggml_cast(ctx0, act_up,   GGML_TYPE_F32));
-                ggml_tensor * swiglu   = ggml_swiglu_split(ctx0, gate_f32, up_f32);
+                ggml_tensor * gate_act_f32 = ggml_cont(ctx0, ggml_cast(ctx0, act_gate, GGML_TYPE_F32));
+                ggml_tensor * up_act_f32   = ggml_cont(ctx0, ggml_cast(ctx0, act_up,   GGML_TYPE_F32));
+                ggml_tensor * swiglu   = ggml_swiglu_split(ctx0, gate_act_f32, up_act_f32);
                 cb(swiglu, "magnet_swiglu_sparse", il);
 
-                ggml_tensor * down_out = build_lora_mm_id(down_as, swiglu, selected);
+                ggml_tensor * down_out = build_lora_mm_id(down_w, swiglu, mm_ids);
                 down_out = ggml_cont(ctx0, ggml_cast(ctx0, down_out, GGML_TYPE_F32));
                 cb(down_out, "magnet_down_sparse", il);
 
                 mg_out = helix_sum_dim1_rows(ctx0, down_out, n_embd_cur, n_ffn_tokens);
                 cb(mg_out, "magnet_ffn_out", il);
             } else if (sparse_mode) {
-                // Top-K masked dense FFN (width sweep). Full matmuls + mask from magnet scores.
-                ggml_tensor * selected = ggml_top_k(ctx0, magnet_scores, (int) active_k);
+                ggml_tensor * selected = ggml_cont(ctx0, ggml_argsort_top_k(ctx0, magnet_scores, (int) active_k));
                 cb(selected, "magnet_topk", il);
 
-                const float target_frac = (n_ff > 0) ? (float) active_k / (float) n_ff : 0.20f;
-                const float scale = 0.68f * target_frac;
-                ggml_tensor * scores_abs = ggml_abs(ctx0, magnet_scores);
-                ggml_tensor * scores_mean = ggml_mean(ctx0, scores_abs);
-                ggml_tensor * mg_threshold = ggml_scale(ctx0, ggml_repeat(ctx0, scores_mean, scores_abs), scale);
-                ggml_tensor * mg_above = ggml_sub(ctx0, scores_abs, mg_threshold);
-                ggml_tensor * mg_mask = ggml_step(ctx0, mg_above);
+                ggml_tensor * mg_mask = use_dynamic
+                    ? helix_magnet_build_dynamic_mask(ctx0, magnet_scores, il)
+                    : helix_magnet_build_topk_mask(ctx0, magnet_scores, (int) active_k);
                 cb(mg_mask, "magnet_mask", il);
 
                 ggml_tensor * act_gate_mg = ggml_mul_mat(ctx0, ffn_gate, cur_f32_mg);
-                ggml_tensor * gate_silu_mg = ggml_silu(ctx0, act_gate_mg);
-                ggml_tensor * gate_masked_mg = ggml_mul(ctx0, gate_silu_mg, mg_mask);
-                cb(gate_masked_mg, "magnet_gate_masked", il);
-                ggml_tensor * act_up_mg = ggml_mul_mat(ctx0, ffn_up, cur_f32_mg);
-                ggml_tensor * z_sparse_mg = ggml_mul(ctx0, gate_masked_mg, act_up_mg);
+                ggml_tensor * act_up_mg   = ggml_mul_mat(ctx0, ffn_up, cur_f32_mg);
+                ggml_tensor * z_full_mg   = ggml_mul(ctx0, ggml_silu(ctx0, act_gate_mg), act_up_mg);
+                ggml_tensor * z_sparse_mg = ggml_mul(ctx0, z_full_mg, mg_mask);
+                cb(z_sparse_mg, "magnet_swiglu_masked", il);
                 mg_out = ggml_mul_mat(ctx0, ffn_down, z_sparse_mg);
                 cb(mg_out, "magnet_ffn_out", il);
             } else {
@@ -2585,9 +2700,11 @@ ggml_tensor * llm_graph_context::build_helix_dnpa_sparse_ffn(
                     fprintf(stderr,
                         "\n[HELIX MAGNET] Engine active: 25 magnet layers | 3 dense | %s | "
                         "width dial: %s | per-token activation %% after each reply\n\n",
-                        helix_magnet_row_gather_enabled() ? "row gather (mul_mat_id)"
-                        : (helix_magnet_sparse_mode_enabled() ? "top-k masked dense (HELIX_MAGNET_SPARSE)"
-                                                              : "dense FFN (HELIX_MAGNET_DENSE=1)"),
+                        helix_magnet_paged_enabled() ? "paged gather (GPU scratchpad + H2D)"
+                        : (helix_magnet_row_gather_enabled()
+                            ? (use_dynamic ? "row gather + dynamic k" : "row gather (mul_mat_id)")
+                            : (helix_magnet_sparse_mode_enabled() ? "top-k masked dense, gate-guided width"
+                                                                  : "dense FFN (HELIX_MAGNET_DENSE=1)")),
                         wf > 0.0f ? "HELIX_MAGNET_WIDTH_FRAC env"
                                     : "default L3-12=25%% L13-27=20%%");
                 }
@@ -3037,7 +3154,10 @@ ggml_tensor * llm_graph_context::build_ffn(
          ggml_tensor * helix_shared_core_up,
          ggml_tensor * helix_shared_core_down,
          ggml_tensor * helix_magnet_a,
-         ggml_tensor * helix_magnet_b) const {
+         ggml_tensor * helix_magnet_b,
+         ggml_tensor * helix_ffn_gate_live,
+         ggml_tensor * helix_ffn_up_live,
+         ggml_tensor * helix_ffn_down_live) const {
     ggml_tensor * ffn_up   = up;
     ggml_tensor * ffn_gate = gate;
     ggml_tensor * ffn_down = down;
@@ -3054,7 +3174,8 @@ ggml_tensor * llm_graph_context::build_ffn(
             nullptr, nullptr, nullptr,
             nullptr, nullptr, il,
             nullptr, nullptr, nullptr,
-            helix_magnet_a, helix_magnet_b);
+            helix_magnet_a, helix_magnet_b,
+            helix_ffn_gate_live, helix_ffn_up_live, helix_ffn_down_live);
         if (helix_out != nullptr) {
             return helix_out;
         }
@@ -3073,7 +3194,8 @@ ggml_tensor * llm_graph_context::build_ffn(
             helix_ffn_gate_exps, helix_ffn_up_exps, helix_ffn_down_exps,
             helix_router_gate, helix_cluster_map, il,
             helix_shared_core_gate, helix_shared_core_up, helix_shared_core_down,
-            helix_magnet_a, helix_magnet_b);
+            helix_magnet_a, helix_magnet_b,
+            helix_ffn_gate_live, helix_ffn_up_live, helix_ffn_down_live);
     }
     if (helix_trace_file() != nullptr && helix_trace_layer_wanted(il)) {
         HELIX_TRACE_FPRINTF(

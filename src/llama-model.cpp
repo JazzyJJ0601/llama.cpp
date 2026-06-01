@@ -1,5 +1,7 @@
 #include "llama-model.h"
 
+#include "helix-paging.h"
+
 #include "llama-arch.h"
 #include "llama-ext.h"
 #include "llama-hparams.h"
@@ -973,9 +975,18 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
 }
 
 llama_model::~llama_model() {
+    free_helix_paging_buffers();
     for (auto * lora : loras) {
         delete lora;
     }
+}
+
+bool llama_model::init_helix_paging_buffers() {
+    return llama_model_init_helix_paging_buffers(*this);
+}
+
+void llama_model::free_helix_paging_buffers() {
+    llama_model_free_helix_paging_buffers(*this);
 }
 
 void llama_model_base::load_stats(llama_model_loader & ml) {

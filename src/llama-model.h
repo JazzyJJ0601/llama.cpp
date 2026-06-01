@@ -300,6 +300,11 @@ struct llama_layer {
     struct ggml_tensor * helix_magnet_a = nullptr;
     struct ggml_tensor * helix_magnet_b = nullptr;
 
+    // Phase 2 demand paging: fixed GPU scratchpads [n_embd x k_max] (gate/up) and [k_max x n_embd] (down)
+    struct ggml_tensor * helix_ffn_gate_live  = nullptr;
+    struct ggml_tensor * helix_ffn_up_live    = nullptr;
+    struct ggml_tensor * helix_ffn_down_live  = nullptr;
+
     // ff MoE
     struct ggml_tensor * ffn_gate_inp      = nullptr;
     struct ggml_tensor * ffn_gate_inp_s    = nullptr; // gemma4
@@ -642,6 +647,10 @@ struct llama_model {
 
     // load Helix DNPA routing metadata from a self-describing external sidecar binary
     void load_helix_sidecar(const std::string & filename);
+
+    // Allocate GPU scratchpads for HELIX_MAGNET_PAGED (after load_tensors).
+    bool init_helix_paging_buffers();
+    void free_helix_paging_buffers();
 
     // Verify helix_cluster_map matches cluster-contiguous permuted weights (map[i] == i / cluster_width).
     void validate_helix_layout();

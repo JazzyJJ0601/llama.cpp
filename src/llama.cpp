@@ -328,6 +328,11 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
             return {-2, nullptr};
         }
 
+        if (!model->init_helix_paging_buffers()) {
+            LLAMA_LOG_ERROR("%s: failed to init Helix paging scratchpads\n", __func__);
+            return {-2, nullptr};
+        }
+
         if (params.helix_sidecar_path != nullptr && params.helix_sidecar_path[0] != '\0') {
             model->load_helix_sidecar(params.helix_sidecar_path);
         } else {
