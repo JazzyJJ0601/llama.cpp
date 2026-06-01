@@ -2678,6 +2678,9 @@ ggml_tensor * llm_graph_context::build_helix_dnpa_sparse_ffn(
                     ggml_tensor * down_ready = ggml_reshape_2d(ctx0, down_packed, gather_k, n_embd_cur);
 
                     mg_out = ggml_mul_mat(ctx0, down_ready, swiglu);
+                    // Anchor mask+topk into graph so eval callback can read stats
+                    mg_out = helix_sparsity_anchor_tensor(ctx0, mg_out, mg_mask);
+                    mg_out = helix_sparsity_anchor_tensor(ctx0, mg_out, selected);
                     cb(mg_out, "magnet_down_paged", il);
                 } else {
                     // FAST PATH: masked dense matmuls — same speed as baseline.
