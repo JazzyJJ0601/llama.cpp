@@ -223,6 +223,29 @@ bool helix_sparsity_get(struct helix_sparsity_stats * out) {
         out->ffn_flop_saved_pct = 0.0;
     }
 
+    out->decode_active_neurons = g_helix_sparsity.decode_active;
+    out->decode_total_neurons  = g_helix_sparsity.decode_total;
+
+    // Estimate VRAM saved: for each sparse layer, (1 - active_frac) of the 3 FFN
+    // matrices (gate+up: n_embd×n_ff each, down: n_ff×n_embd) would be offloaded.
+    // Use 2 bytes/param (f16) as the baseline weight size.
+    double vram_saved = 0.0;
+    if (n_sparse > 0) {
+        const double active_frac = out->active_neuron_measured
+            ? (out->active_neuron_decode_pct > 0.0 ? out->active_neuron_decode_pct / 100.0 : out->active_neuron_pct / 100.0)
+            : out->active_budget_pct / 100.0;
+        for (int il = 3; il < HELIX_SPARSITY_N_LAYERS; ++il) {
+            if (!g_helix_sparsity.layer_magnet[il] && !g_helix_sparsity.layer_gate[il]) {
+                continue;
+            }
+            const int64_t nff = g_helix_layer_n_ff[il] > 0 ? g_helix_layer_n_ff[il] : 6144;
+            const int64_t ne  = 2048;
+            const double layer_bytes = 3.0 * (double)(nff * ne) * 2.0;
+            vram_saved += layer_bytes * (1.0 - active_frac);
+        }
+    }
+    out->vram_saved_mib = vram_saved / (1024.0 * 1024.0);
+
     return engine_active;
 }
 
@@ -2585,11 +2608,13 @@ ggml_tensor * llm_graph_context::build_helix_dnpa_sparse_ffn(
                     helix_ffn_gate_live != nullptr && helix_ffn_up_live != nullptr &&
                     helix_ffn_down_live != nullptr;
 
-                ggml_tensor * gate_f32 = ggml_cont(ctx0, ggml_cast(ctx0, ffn_gate, GGML_TYPE_F32));
-                ggml_tensor * up_f32   = ggml_cont(ctx0, ggml_cast(ctx0, ffn_up,   GGML_TYPE_F32));
+                // Reshape weights to 3D for mul_mat_id — stay in native dtype
+                // to avoid casting all n_ff rows when we only need gather_k.
+                // Down needs F32 reshape because (1, n_embd, n_ff) has ne[0]=1
+                // which violates quantized block alignment.
+                ggml_tensor * gate_as = ggml_reshape_3d(ctx0, ffn_gate, n_embd_cur, 1, n_ff);
+                ggml_tensor * up_as   = ggml_reshape_3d(ctx0, ffn_up,   n_embd_cur, 1, n_ff);
                 ggml_tensor * down_f32 = ggml_cont(ctx0, ggml_cast(ctx0, ffn_down, GGML_TYPE_F32));
-                ggml_tensor * gate_as = ggml_reshape_3d(ctx0, gate_f32, n_embd_cur, 1, n_ff);
-                ggml_tensor * up_as   = ggml_reshape_3d(ctx0, up_f32,   n_embd_cur, 1, n_ff);
                 ggml_tensor * down_as = ggml_reshape_3d(ctx0, down_f32, 1, n_embd_cur, n_ff);
 
                 ggml_tensor * gate_w = gate_as;
@@ -2621,13 +2646,10 @@ ggml_tensor * llm_graph_context::build_helix_dnpa_sparse_ffn(
                 cb(act_gate, "magnet_gate_sparse", il);
                 cb(act_up, "magnet_up_sparse", il);
 
-                ggml_tensor * gate_act_f32 = ggml_cont(ctx0, ggml_cast(ctx0, act_gate, GGML_TYPE_F32));
-                ggml_tensor * up_act_f32   = ggml_cont(ctx0, ggml_cast(ctx0, act_up,   GGML_TYPE_F32));
-                ggml_tensor * swiglu   = ggml_swiglu_split(ctx0, gate_act_f32, up_act_f32);
+                ggml_tensor * swiglu = ggml_swiglu_split(ctx0, act_gate, act_up);
                 cb(swiglu, "magnet_swiglu_sparse", il);
 
                 ggml_tensor * down_out = build_lora_mm_id(down_w, swiglu, mm_ids);
-                down_out = ggml_cont(ctx0, ggml_cast(ctx0, down_out, GGML_TYPE_F32));
                 cb(down_out, "magnet_down_sparse", il);
 
                 mg_out = helix_sum_dim1_rows(ctx0, down_out, n_embd_cur, n_ffn_tokens);

@@ -659,14 +659,23 @@ int llama_cli(int argc, char ** argv) {
                     if (st.n_magnet_layers > 0) {
                         if (st.active_neuron_measured) {
                             console::log(
-                                "[ Helix Magnet: %d magnet + %d dense | %.2f%% active all-tokens (measured) "
-                                "| %.2f%% active decode-only | %.1f%% sparse budget | %llu mask reads (%llu decode) "
-                                "| FFN %s | ~%.0f%% FLOP savings (sparse layers) ]\n",
-                                st.n_magnet_layers, st.n_dense_layers, st.active_neuron_pct,
-                                st.active_neuron_decode_pct, st.active_budget_pct,
-                                (unsigned long long) st.mask_reads,
-                                (unsigned long long) st.decode_mask_reads,
-                                ffn_mode, st.ffn_flop_saved_pct);
+                                "[ Helix Magnet: %d magnet + %d dense | FFN %s ]\n",
+                                st.n_magnet_layers, st.n_dense_layers, ffn_mode);
+                            if (st.decode_total_neurons > 0) {
+                                console::log(
+                                    "[ Neurons: %llu / %llu active (%.1f%% decode) | Budget: %.0f%% ]\n",
+                                    (unsigned long long) st.decode_active_neurons,
+                                    (unsigned long long) st.decode_total_neurons,
+                                    st.active_neuron_decode_pct,
+                                    st.active_budget_pct);
+                            } else {
+                                console::log(
+                                    "[ Neurons: %.1f%% active (measured) | Budget: %.0f%% ]\n",
+                                    st.active_neuron_pct, st.active_budget_pct);
+                            }
+                            console::log(
+                                "[ VRAM saved: ~%.0f MiB | ~%.0f%% FFN FLOPs saved ]\n",
+                                st.vram_saved_mib, st.ffn_flop_saved_pct);
                         } else {
                             console::log(
                                 "[ Helix Magnet: %d magnet + %d dense | (no live mask samples — rebuild llama-cli) "

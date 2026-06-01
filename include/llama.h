@@ -1589,6 +1589,9 @@ extern "C" {
         bool    active_neuron_measured;  // true after cb_eval sampled magnet_mask tensors
         uint64_t mask_reads;            // magnet_mask tensor reads (≈ 25 × forward passes)
         uint64_t decode_mask_reads;     // mask reads during decode-only forwards
+        uint64_t decode_active_neurons; // absolute active neuron count (decode tokens)
+        uint64_t decode_total_neurons;  // absolute total neuron count (decode tokens)
+        double  vram_saved_mib;         // estimated VRAM saved by sparsity (MiB)
     };
 
     LLAMA_API void llama_helix_sparsity_reset(void);
