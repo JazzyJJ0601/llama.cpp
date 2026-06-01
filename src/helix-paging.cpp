@@ -165,11 +165,11 @@ bool llama_model_init_helix_paging_buffers(llama_model & model) {
         auto & layer = model.layers[p.il];
 
         layer.helix_ffn_gate_live = ggml_new_tensor_2d(
-                g_helix_paging.ctx.get(), GGML_TYPE_F32, p.n_embd, p.k_max);
+                g_helix_paging.ctx.get(), GGML_TYPE_F16, p.n_embd, p.k_max);
         layer.helix_ffn_up_live = ggml_new_tensor_2d(
-                g_helix_paging.ctx.get(), GGML_TYPE_F32, p.n_embd, p.k_max);
+                g_helix_paging.ctx.get(), GGML_TYPE_F16, p.n_embd, p.k_max);
         layer.helix_ffn_down_live = ggml_new_tensor_2d(
-                g_helix_paging.ctx.get(), GGML_TYPE_F32, p.k_max, p.n_embd);
+                g_helix_paging.ctx.get(), GGML_TYPE_F16, p.k_max, p.n_embd);
 
         for (ggml_tensor * t : { layer.helix_ffn_gate_live, layer.helix_ffn_up_live, layer.helix_ffn_down_live }) {
             ggml_set_name(t, "helix_ffn_live");
