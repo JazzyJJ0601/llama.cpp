@@ -2713,13 +2713,18 @@ ggml_tensor * llm_graph_context::build_helix_dnpa_sparse_ffn(
                     // Down: ffn_down is [n_ff, n_embd] — need to select
                     // neurons along ne[0].  Transpose to [n_embd, n_ff],
                     // gather, then mul_mat.
+                    // ffn_down [n_ff, n_embd]: neurons in ne[0], get_rows
+                    // selects ne[1]. Transpose → [n_embd, n_ff], gather →
+                    // [n_embd, gather_k], transpose back → [gather_k, n_embd].
                     ggml_tensor * down_t = ggml_cont(ctx0, ggml_transpose(ctx0, ffn_down));
                     ggml_tensor * down_packed = helix_graph_paged_pack_rows(
                         ctx0, down_t, sel_1d, helix_ffn_down_live, gather_k);
-                    // down_packed: [n_embd, gather_k]
-                    // swiglu: [gather_k, 1]
-                    // mul_mat: [n_embd, gather_k]^T @ [gather_k, 1] → [n_embd, 1]
-                    mg_out = ggml_mul_mat(ctx0, down_packed, swiglu);
+                    // down_packed: [n_embd, gather_k] — transpose for mul_mat
+                    ggml_tensor * down_ready = ggml_cont(ctx0, ggml_transpose(ctx0, down_packed));
+                    // down_ready: [gather_k, n_embd]
+                    // swiglu:     [gather_k, 1]
+                    // mul_mat:    [gather_k, n_embd]^T @ [gather_k, 1] → [n_embd, 1]
+                    mg_out = ggml_mul_mat(ctx0, down_ready, swiglu);
                     cb(mg_out, "magnet_down_paged", il);
                 } else {
                     // FAST PATH: dense compute + stats measurement.
