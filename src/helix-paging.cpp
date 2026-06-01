@@ -16,7 +16,16 @@ static bool helix_env_flag_active(const char * name) {
 }
 
 bool helix_magnet_paging_requested(void) {
-    return helix_env_flag_active("HELIX_DOPPELGANGER") && helix_env_flag_active("HELIX_MAGNET_PAGED");
+    // Paged mode via env var (backward compat)
+    if (helix_env_flag_active("HELIX_MAGNET_PAGED")) {
+        return true;
+    }
+    // Also activate when FFN weights are offloaded to CPU via -ot/-CpuFfn.
+    // Detected by HELIX_MAGNET_CPU_FFN which the launcher sets.
+    if (helix_env_flag_active("HELIX_MAGNET_CPU_FFN")) {
+        return true;
+    }
+    return false;
 }
 
 static float helix_magnet_max_frac(void) {
@@ -235,11 +244,27 @@ void llama_model_free_helix_paging_buffers(llama_model & model) {
 }
 
 bool llama_model_init_helix_paging_buffers(llama_model & model) {
-    if (!helix_magnet_paging_requested()) {
+    if (g_helix_paging.ready) {
         return true;
     }
 
-    if (g_helix_paging.ready) {
+    // Check if paging is needed: either explicitly requested via env var,
+    // or auto-detected when FFN weights landed on CPU (from -ot flag).
+    bool needs_paging = helix_magnet_paging_requested();
+    if (!needs_paging) {
+        // Auto-detect: check if any magnet layer's FFN weights are on a
+        // different backend than the first layer (indicating CPU offload).
+        for (int il = 3; il < (int) model.hparams.n_layer && !needs_paging; ++il) {
+            auto & layer = model.layers[il];
+            if (layer.helix_magnet_a != nullptr && layer.ffn_gate != nullptr) {
+                if (layer.ffn_gate->buffer != nullptr &&
+                    ggml_backend_buffer_is_host(layer.ffn_gate->buffer)) {
+                    needs_paging = true;
+                }
+            }
+        }
+    }
+    if (!needs_paging) {
         return true;
     }
 

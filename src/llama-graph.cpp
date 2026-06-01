@@ -1616,15 +1616,18 @@ static bool helix_magnet_sparse_mode_enabled() {
 }
 
 static bool helix_magnet_row_gather_enabled() {
-    if (!helix_magnet_sparse_mode_enabled()) {
-        return false;
-    }
-    return helix_env_flag_active("HELIX_MAGNET_GATHER") || helix_magnet_staged_enabled();
+    return helix_magnet_staged_enabled() ||
+           helix_env_flag_active("HELIX_MAGNET_GATHER");
 }
 
-// Phase 2 demand paging: CPU-backed FFN + async row gather into VRAM scratchpad (see HELIX_DOPPELGANGER_PAGING.md).
 static bool helix_magnet_paged_enabled() {
-    return helix_doppelganger_enabled() && helix_env_flag_active("HELIX_MAGNET_PAGED");
+    // Paged mode is active when _live scratchpads were allocated.
+    // The allocation is triggered by -CpuFfn/-Paged flags which put FFN
+    // weights on CPU via -ot.  We detect it from the _live tensors existing
+    // in the graph builder (passed as function args), not env vars.
+    // This function is kept for backward compat; the real check is
+    // use_paged in the graph builder which tests _live != nullptr.
+    return helix_env_flag_active("HELIX_MAGNET_PAGED");
 }
 
 static ggml_tensor * helix_sum_dim1_rows(
@@ -2658,7 +2661,10 @@ ggml_tensor * llm_graph_context::build_helix_dnpa_sparse_ffn(
             }
 
             const bool sparse_mode   = helix_magnet_sparse_mode_enabled();
-            const bool sparse_gather = helix_magnet_row_gather_enabled();
+            const bool has_live_bufs = helix_ffn_gate_live != nullptr &&
+                                       helix_ffn_up_live   != nullptr &&
+                                       helix_ffn_down_live != nullptr;
+            const bool sparse_gather = helix_magnet_row_gather_enabled() || has_live_bufs;
             const bool use_dynamic   = helix_magnet_dynamic_enabled();
             ggml_tensor * mg_out = nullptr;
 
@@ -2674,10 +2680,10 @@ ggml_tensor * llm_graph_context::build_helix_dnpa_sparse_ffn(
                 const int64_t n_embd_cur = cur_f32_mg->ne[0];
                 const int64_t n_ffn_tokens = cur_f32_mg->ne[1];
 
-                // Paged path only works for single-token decode (n_tokens=1).
-                // Multi-token prompts fall through to masked dense path.
-                const bool use_paged = helix_magnet_paged_enabled() &&
-                    n_ffn_tokens == 1 &&
+                // Paged path activates when _live scratchpads exist (allocated
+                // by -CpuFfn/-Paged).  Only for single-token decode; prompts
+                // fall through to dense.
+                const bool use_paged = n_ffn_tokens == 1 &&
                     helix_ffn_gate_live != nullptr && helix_ffn_up_live != nullptr &&
                     helix_ffn_down_live != nullptr;
 
