@@ -707,6 +707,19 @@ int llama_cli(int argc, char ** argv) {
                 } else {
                     console::log("[ Helix: HELIX_DOPPELGANGER on — magnet path not active (missing magnet tensors in GGUF?) ]\n");
                 }
+                // Per-token activation profiler
+                helix_profile_stats prof {};
+                if (llama_helix_profile_get(&prof)) {
+                    console::log(
+                        "[ Profile: %d tokens | mean %.1f%% active | min %.1f%% | p50 %.1f%% | p95 %.1f%% | max %.1f%% ]\n",
+                        prof.n_tokens, prof.mean_active_pct,
+                        prof.min_active_pct, prof.p50_active_pct,
+                        prof.p95_active_pct, prof.max_active_pct);
+                    console::log(
+                        "[ Profile: mean %lld / %lld neurons per token across all layers ]\n",
+                        (long long) prof.mean_active_neurons,
+                        (long long) prof.mean_total_neurons);
+                }
             }
             console::set_display(DISPLAY_TYPE_RESET);
         }

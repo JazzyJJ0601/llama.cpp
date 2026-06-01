@@ -1600,6 +1600,19 @@ extern "C" {
     LLAMA_API void llama_helix_sparsity_reset(void);
     LLAMA_API bool llama_helix_sparsity_get(struct helix_sparsity_stats * out);
 
+    struct helix_profile_stats {
+        int32_t  n_tokens;
+        double   mean_active_pct;
+        double   min_active_pct;
+        double   max_active_pct;
+        double   p50_active_pct;
+        double   p95_active_pct;
+        int64_t  mean_active_neurons;
+        int64_t  mean_total_neurons;
+    };
+
+    LLAMA_API bool llama_helix_profile_get(struct helix_profile_stats * out);
+
 #ifdef __cplusplus
 }
 #endif

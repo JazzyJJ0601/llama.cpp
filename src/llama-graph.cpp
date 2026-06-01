@@ -50,6 +50,14 @@ struct helix_sparsity_runtime {
     uint64_t decode_mask_samples = 0;
     bool layer_magnet[HELIX_SPARSITY_N_LAYERS] = {};
     bool layer_gate[HELIX_SPARSITY_N_LAYERS]   = {};
+
+    // Per-token activation profiler (HELIX_MAGNET_PROFILE=1)
+    // Tracks per-decode-token activation counts across all magnet layers.
+    // Each entry = sum of active neurons across all layers for one token.
+    std::vector<int64_t> profile_per_token_active;
+    std::vector<int64_t> profile_per_token_total;
+    int profile_layers_this_token_active = 0;
+    int profile_layers_this_token_total  = 0;
 };
 
 static double helix_magnet_active_budget_pct() {
@@ -267,6 +275,44 @@ void llama_helix_sparsity_reset(void) {
 
 bool llama_helix_sparsity_get(struct helix_sparsity_stats * out) {
     return helix_sparsity_get(out);
+}
+
+bool llama_helix_profile_get(struct helix_profile_stats * out) {
+    if (out == nullptr) {
+        return false;
+    }
+    const auto & pa = g_helix_sparsity.profile_per_token_active;
+    const auto & pt = g_helix_sparsity.profile_per_token_total;
+    const int n = (int) pa.size();
+    if (n == 0 || pt.empty()) {
+        return false;
+    }
+
+    std::vector<double> pcts((size_t) n);
+    for (int i = 0; i < n; ++i) {
+        pcts[i] = pt[i] > 0 ? 100.0 * (double) pa[i] / (double) pt[i] : 0.0;
+    }
+
+    std::vector<double> sorted_pcts = pcts;
+    std::sort(sorted_pcts.begin(), sorted_pcts.end());
+
+    double sum_pct = 0.0;
+    int64_t sum_active = 0, sum_total = 0;
+    for (int i = 0; i < n; ++i) {
+        sum_pct    += pcts[i];
+        sum_active += pa[i];
+        sum_total  += pt[i];
+    }
+
+    out->n_tokens           = n;
+    out->mean_active_pct    = sum_pct / n;
+    out->min_active_pct     = sorted_pcts[0];
+    out->max_active_pct     = sorted_pcts[n - 1];
+    out->p50_active_pct     = sorted_pcts[n / 2];
+    out->p95_active_pct     = sorted_pcts[(int)(n * 0.95)];
+    out->mean_active_neurons = sum_active / n;
+    out->mean_total_neurons  = sum_total / n;
+    return true;
 }
 
 // dedup helpers
@@ -2385,6 +2431,18 @@ bool helix_runtime_cb_eval(ggml_tensor * t, bool ask, void * user_data) {
                         g_helix_sparsity.decode_total  += (uint64_t) n_ff;
                         ++g_helix_sparsity.decode_mask_samples;
 
+                        // Per-token profiler: accumulate across layers
+                        g_helix_sparsity.profile_layers_this_token_active += (int) k_sel;
+                        g_helix_sparsity.profile_layers_this_token_total  += (int) n_ff;
+                        if (il == HELIX_SPARSITY_N_LAYERS - 1 || il >= 25) {
+                            g_helix_sparsity.profile_per_token_active.push_back(
+                                g_helix_sparsity.profile_layers_this_token_active);
+                            g_helix_sparsity.profile_per_token_total.push_back(
+                                g_helix_sparsity.profile_layers_this_token_total);
+                            g_helix_sparsity.profile_layers_this_token_active = 0;
+                            g_helix_sparsity.profile_layers_this_token_total  = 0;
+                        }
+
                         // Feed selected indices to the delta neuron cache
                         if (helix_magnet_paged_enabled() && il >= 0) {
                             std::vector<int32_t> idx_buf((size_t) k_sel);
@@ -2678,9 +2736,9 @@ ggml_tensor * llm_graph_context::build_helix_dnpa_sparse_ffn(
                     ggml_tensor * down_ready = ggml_reshape_2d(ctx0, down_packed, gather_k, n_embd_cur);
 
                     mg_out = ggml_mul_mat(ctx0, down_ready, swiglu);
-                    // Anchor mask+topk into graph so eval callback can read stats
+                    // Anchor mask into graph so eval callback can read stats.
+                    // (selected is already in graph via pack_rows dependency)
                     mg_out = helix_sparsity_anchor_tensor(ctx0, mg_out, mg_mask);
-                    mg_out = helix_sparsity_anchor_tensor(ctx0, mg_out, selected);
                     cb(mg_out, "magnet_down_paged", il);
                 } else {
                     // FAST PATH: masked dense matmuls — same speed as baseline.
