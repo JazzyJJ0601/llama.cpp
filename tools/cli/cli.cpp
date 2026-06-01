@@ -647,7 +647,45 @@ int llama_cli(int argc, char ** argv) {
         if (params.show_timings) {
             console::set_display(DISPLAY_TYPE_INFO);
             console::log("\n");
-            console::log("[ Prompt: %.1f t/s | Generation: %.1f t/s ]\n", timings.prompt_per_second, timings.predicted_per_second);
+            if (std::getenv("HELIX_DOPPELGANGER")) {
+                helix_sparsity_stats st0 {};
+                helix_profile_stats  pr0 {};
+                const bool has_st = llama_helix_sparsity_get(&st0) && st0.engine_active;
+                const bool has_pr = llama_helix_profile_get(&pr0);
+                if (has_st && st0.active_neuron_measured && st0.decode_total_neurons > 0) {
+                    const uint64_t skipped = st0.decode_total_neurons - st0.decode_active_neurons;
+                    console::log("[ Prompt: %.1f t/s | Generation: %.1f t/s | Neurons: %llu loaded, %llu skipped (%.1f%%) | VRAM saved: ~%.0f MiB ]\n",
+                        timings.prompt_per_second, timings.predicted_per_second,
+                        (unsigned long long) st0.decode_active_neurons,
+                        (unsigned long long) skipped,
+                        st0.active_neuron_decode_pct,
+                        st0.vram_saved_mib);
+                } else if (has_pr) {
+                    console::log("[ Prompt: %.1f t/s | Generation: %.1f t/s | mean %.1f%% active (%lld / %lld neurons) ]\n",
+                        timings.prompt_per_second, timings.predicted_per_second,
+                        pr0.mean_active_pct,
+                        (long long) pr0.mean_active_neurons,
+                        (long long) pr0.mean_total_neurons);
+                } else {
+                    console::log("[ Prompt: %.1f t/s | Generation: %.1f t/s ]\n",
+                        timings.prompt_per_second, timings.predicted_per_second);
+                }
+                if (has_pr) {
+                    console::log("[ Profile: %d tokens | mean %.1f%% | min %.1f%% | p50 %.1f%% | p95 %.1f%% | max %.1f%% ]\n",
+                        pr0.n_tokens, pr0.mean_active_pct,
+                        pr0.min_active_pct, pr0.p50_active_pct,
+                        pr0.p95_active_pct, pr0.max_active_pct);
+                }
+                if (has_st && (st0.cache_rows_fetched > 0 || st0.cache_rows_hit > 0)) {
+                    console::log("[ Cache: %.1f%% hit | %llu fetched, %llu cached ]\n",
+                        st0.cache_hit_rate_pct,
+                        (unsigned long long) st0.cache_rows_fetched,
+                        (unsigned long long) st0.cache_rows_hit);
+                }
+            } else {
+                console::log("[ Prompt: %.1f t/s | Generation: %.1f t/s ]\n",
+                    timings.prompt_per_second, timings.predicted_per_second);
+            }
             if (std::getenv("HELIX_DOPPELGANGER")) {
                 helix_sparsity_stats st {};
                 if (llama_helix_sparsity_get(&st) && st.engine_active) {
