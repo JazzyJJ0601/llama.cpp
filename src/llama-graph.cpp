@@ -2610,13 +2610,12 @@ ggml_tensor * llm_graph_context::build_helix_dnpa_sparse_ffn(
                     // selected rows into GPU _live scratchpads (F16) via
                     // get_rows+cpy, then direct mul_mat on the contiguous 2D
                     // slabs.  No mul_mat_id, no 3D reshapes, no expert dispatch.
-                    //
-                    // After pack_rows, the scratchpads hold contiguous slabs:
-                    //   gate_live [n_embd, k_max]  — selected gate rows
-                    //   up_live   [n_embd, k_max]  — selected up rows
-                    //   down_live [k_max, n_embd]  — selected down rows
-                    // Direct mul_mat on these gives the same result as the
-                    // dense path but with physically smaller matrices.
+
+                    // Build mask for sparsity stats tracking (cheap — reuses magnet_scores)
+                    ggml_tensor * mg_mask = use_dynamic
+                        ? helix_magnet_build_dynamic_mask(ctx0, magnet_scores, il)
+                        : helix_magnet_build_topk_mask(ctx0, magnet_scores, (int) gather_k);
+                    cb(mg_mask, "magnet_mask", il);
 
                     // Reshape source weights to 3D for get_rows indexing
                     ggml_tensor * gate_as = ggml_reshape_3d(ctx0, ffn_gate, n_embd_cur, 1, n_ff);
