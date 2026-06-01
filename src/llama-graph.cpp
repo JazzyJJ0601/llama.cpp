@@ -2682,7 +2682,10 @@ ggml_tensor * llm_graph_context::build_helix_dnpa_sparse_ffn(
                 const int64_t n_embd_cur = cur_f32_mg->ne[0];
                 const int64_t n_ffn_tokens = cur_f32_mg->ne[1];
 
+                // Paged path only works for single-token decode (n_tokens=1).
+                // Multi-token prompts fall through to masked dense path.
                 const bool use_paged = helix_magnet_paged_enabled() &&
+                    n_ffn_tokens == 1 &&
                     helix_ffn_gate_live != nullptr && helix_ffn_up_live != nullptr &&
                     helix_ffn_down_live != nullptr;
 
