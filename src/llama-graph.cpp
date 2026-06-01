@@ -2602,57 +2602,33 @@ ggml_tensor * llm_graph_context::build_helix_dnpa_sparse_ffn(
 
                 const int64_t n_embd_cur = cur_f32_mg->ne[0];
                 const int64_t n_ffn_tokens = cur_f32_mg->ne[1];
-                ggml_tensor * cur_3d = ggml_reshape_3d(ctx0, cur_f32_mg, n_embd_cur, 1, n_ffn_tokens);
 
-                const bool use_paged = helix_magnet_paged_enabled() &&
-                    helix_ffn_gate_live != nullptr && helix_ffn_up_live != nullptr &&
-                    helix_ffn_down_live != nullptr;
+                // Sparse FFN via top-k masking + dense matmuls.
+                //
+                // On small models (1.7B), the FFN matmuls are memory-bandwidth
+                // bound during single-token decode — they're just mat-vecs.
+                // The overhead of get_rows/mul_mat_id dispatch (designed for MoE
+                // with 2-8 large expert slabs, not 1350 individual rows) exceeds
+                // any FLOP savings.  The faster approach: compute the full gate/up
+                // matmuls, mask the SwiGLU activations to zero at inactive neurons,
+                // then do the full down matmul.  The GPU skips zero-multiplied
+                // lanes efficiently, and we avoid all the reshape/cast/gather
+                // overhead entirely.
+                //
+                // The VRAM savings still come from -Paged moving FFN weights to
+                // CPU pinned memory — the compute path here is independent.
+                ggml_tensor * mg_mask = use_dynamic
+                    ? helix_magnet_build_dynamic_mask(ctx0, magnet_scores, il)
+                    : helix_magnet_build_topk_mask(ctx0, magnet_scores, (int) gather_k);
+                cb(mg_mask, "magnet_mask", il);
 
-                // Reshape weights to 3D for mul_mat_id — stay in native dtype
-                // to avoid casting all n_ff rows when we only need gather_k.
-                // Down needs F32 reshape because (1, n_embd, n_ff) has ne[0]=1
-                // which violates quantized block alignment.
-                ggml_tensor * gate_as = ggml_reshape_3d(ctx0, ffn_gate, n_embd_cur, 1, n_ff);
-                ggml_tensor * up_as   = ggml_reshape_3d(ctx0, ffn_up,   n_embd_cur, 1, n_ff);
-                ggml_tensor * down_f32 = ggml_cont(ctx0, ggml_cast(ctx0, ffn_down, GGML_TYPE_F32));
-                ggml_tensor * down_as = ggml_reshape_3d(ctx0, down_f32, 1, n_embd_cur, n_ff);
+                ggml_tensor * act_gate = ggml_mul_mat(ctx0, ffn_gate, cur_f32_mg);
+                ggml_tensor * act_up   = ggml_mul_mat(ctx0, ffn_up, cur_f32_mg);
+                ggml_tensor * z_full   = ggml_mul(ctx0, ggml_silu(ctx0, act_gate), act_up);
+                ggml_tensor * z_sparse = ggml_mul(ctx0, z_full, mg_mask);
+                cb(z_sparse, "magnet_swiglu_masked", il);
 
-                ggml_tensor * gate_w = gate_as;
-                ggml_tensor * up_w   = up_as;
-                ggml_tensor * down_w = down_as;
-                ggml_tensor * mm_ids = selected;
-
-                if (use_paged) {
-                    ggml_tensor * gate_live_3d = ggml_reshape_3d(ctx0, helix_ffn_gate_live, n_embd_cur, 1, k_max);
-                    ggml_tensor * up_live_3d   = ggml_reshape_3d(ctx0, helix_ffn_up_live,   n_embd_cur, 1, k_max);
-                    ggml_tensor * down_live_3d = ggml_reshape_3d(ctx0, helix_ffn_down_live, 1, n_embd_cur, k_max);
-
-                    ggml_tensor * gate_packed = helix_graph_paged_pack_rows(ctx0, gate_as, selected, gate_live_3d, gather_k);
-                    ggml_tensor * up_packed   = helix_graph_paged_pack_rows(ctx0, up_as,   selected, up_live_3d,   gather_k);
-                    ggml_tensor * down_packed = helix_graph_paged_pack_rows(ctx0, down_as, selected, down_live_3d, gather_k);
-                    cb(gate_packed, "magnet_paged_gate", il);
-                    cb(up_packed, "magnet_paged_up", il);
-                    cb(down_packed, "magnet_paged_down", il);
-
-                    gate_w  = gate_live_3d;
-                    up_w    = up_live_3d;
-                    down_w  = down_live_3d;
-                    mm_ids  = helix_graph_seq_indices(ctx0, gather_k, n_ffn_tokens);
-                    cb(mm_ids, "magnet_paged_ids", il);
-                }
-
-                ggml_tensor * act_gate = build_lora_mm_id(gate_w, cur_3d, mm_ids);
-                ggml_tensor * act_up   = build_lora_mm_id(up_w, cur_3d, mm_ids);
-                cb(act_gate, "magnet_gate_sparse", il);
-                cb(act_up, "magnet_up_sparse", il);
-
-                ggml_tensor * swiglu = ggml_swiglu_split(ctx0, act_gate, act_up);
-                cb(swiglu, "magnet_swiglu_sparse", il);
-
-                ggml_tensor * down_out = build_lora_mm_id(down_w, swiglu, mm_ids);
-                cb(down_out, "magnet_down_sparse", il);
-
-                mg_out = helix_sum_dim1_rows(ctx0, down_out, n_embd_cur, n_ffn_tokens);
+                mg_out = ggml_mul_mat(ctx0, ffn_down, z_sparse);
                 cb(mg_out, "magnet_ffn_out", il);
             } else if (sparse_mode) {
                 ggml_tensor * selected = ggml_cont(ctx0, ggml_argsort_top_k(ctx0, magnet_scores, (int) active_k));
