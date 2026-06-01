@@ -179,8 +179,8 @@ bool helix_sparsity_get(struct helix_sparsity_stats * out) {
         n_gate = g_helix_stats.layers_sparse;
     }
 
-    const bool engine_active = helix_env_flag_active("HELIX_DOPPELGANGER") &&
-        (n_magnet > 0 || n_gate > 0 || g_helix_sparsity.mask_samples > 0 || g_helix_stats.printed);
+    const bool engine_active = n_magnet > 0 || n_gate > 0 ||
+        g_helix_sparsity.mask_samples > 0 || g_helix_stats.printed;
 
     out->n_dense_layers    = 3;
     out->n_magnet_layers   = n_magnet;
