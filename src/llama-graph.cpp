@@ -2590,10 +2590,8 @@ ggml_tensor * llm_graph_context::build_helix_dnpa_sparse_ffn(
             ggml_tensor * mg_out = nullptr;
 
             if (sparse_gather) {
-                // Magnet top-k indices; matmul only on k rows (weights stay mmap'd — not all rows computed).
                 const int64_t gather_k = helix_magnet_active_k(il, n_ff);
                 const int64_t k_max    = helix_magnet_k_max(n_ff);
-                // Dynamic + staged: rank by |score| (same threshold family as masked sparse).
                 ggml_tensor * scores_for_pick = use_dynamic
                     ? ggml_abs(ctx0, magnet_scores)
                     : magnet_scores;
@@ -2603,32 +2601,62 @@ ggml_tensor * llm_graph_context::build_helix_dnpa_sparse_ffn(
                 const int64_t n_embd_cur = cur_f32_mg->ne[0];
                 const int64_t n_ffn_tokens = cur_f32_mg->ne[1];
 
-                // Sparse FFN via top-k masking + dense matmuls.
-                //
-                // On small models (1.7B), the FFN matmuls are memory-bandwidth
-                // bound during single-token decode — they're just mat-vecs.
-                // The overhead of get_rows/mul_mat_id dispatch (designed for MoE
-                // with 2-8 large expert slabs, not 1350 individual rows) exceeds
-                // any FLOP savings.  The faster approach: compute the full gate/up
-                // matmuls, mask the SwiGLU activations to zero at inactive neurons,
-                // then do the full down matmul.  The GPU skips zero-multiplied
-                // lanes efficiently, and we avoid all the reshape/cast/gather
-                // overhead entirely.
-                //
-                // The VRAM savings still come from -Paged moving FFN weights to
-                // CPU pinned memory — the compute path here is independent.
-                ggml_tensor * mg_mask = use_dynamic
-                    ? helix_magnet_build_dynamic_mask(ctx0, magnet_scores, il)
-                    : helix_magnet_build_topk_mask(ctx0, magnet_scores, (int) gather_k);
-                cb(mg_mask, "magnet_mask", il);
+                const bool use_paged = helix_magnet_paged_enabled() &&
+                    helix_ffn_gate_live != nullptr && helix_ffn_up_live != nullptr &&
+                    helix_ffn_down_live != nullptr;
 
-                ggml_tensor * act_gate = ggml_mul_mat(ctx0, ffn_gate, cur_f32_mg);
-                ggml_tensor * act_up   = ggml_mul_mat(ctx0, ffn_up, cur_f32_mg);
-                ggml_tensor * z_full   = ggml_mul(ctx0, ggml_silu(ctx0, act_gate), act_up);
-                ggml_tensor * z_sparse = ggml_mul(ctx0, z_full, mg_mask);
-                cb(z_sparse, "magnet_swiglu_masked", il);
+                if (use_paged) {
+                    // PAGED PROOF-OF-CONCEPT PATH: FFN weights on CPU pinned
+                    // memory, gather only selected rows into GPU _live scratchpads
+                    // via get_rows+cpy, then mul_mat_id on the small slab.
+                    // Slower than dense due to mul_mat_id dispatch overhead, but
+                    // demonstrates real VRAM offloading visible in nvidia-smi.
+                    ggml_tensor * cur_3d = ggml_reshape_3d(ctx0, cur_f32_mg, n_embd_cur, 1, n_ffn_tokens);
 
-                mg_out = ggml_mul_mat(ctx0, ffn_down, z_sparse);
+                    ggml_tensor * gate_as = ggml_reshape_3d(ctx0, ffn_gate, n_embd_cur, 1, n_ff);
+                    ggml_tensor * up_as   = ggml_reshape_3d(ctx0, ffn_up,   n_embd_cur, 1, n_ff);
+                    ggml_tensor * down_f32 = ggml_cont(ctx0, ggml_cast(ctx0, ffn_down, GGML_TYPE_F32));
+                    ggml_tensor * down_as = ggml_reshape_3d(ctx0, down_f32, 1, n_embd_cur, n_ff);
+
+                    ggml_tensor * gate_live_3d = ggml_reshape_3d(ctx0, helix_ffn_gate_live, n_embd_cur, 1, k_max);
+                    ggml_tensor * up_live_3d   = ggml_reshape_3d(ctx0, helix_ffn_up_live,   n_embd_cur, 1, k_max);
+                    ggml_tensor * down_live_3d = ggml_reshape_3d(ctx0, helix_ffn_down_live, 1, n_embd_cur, k_max);
+
+                    ggml_tensor * gate_packed = helix_graph_paged_pack_rows(ctx0, gate_as, selected, gate_live_3d, gather_k);
+                    ggml_tensor * up_packed   = helix_graph_paged_pack_rows(ctx0, up_as,   selected, up_live_3d,   gather_k);
+                    ggml_tensor * down_packed = helix_graph_paged_pack_rows(ctx0, down_as, selected, down_live_3d, gather_k);
+                    cb(gate_packed, "magnet_paged_gate", il);
+                    cb(up_packed,   "magnet_paged_up",   il);
+                    cb(down_packed, "magnet_paged_down", il);
+
+                    ggml_tensor * mm_ids = helix_graph_seq_indices(ctx0, gather_k, n_ffn_tokens);
+                    cb(mm_ids, "magnet_paged_ids", il);
+
+                    ggml_tensor * act_gate = build_lora_mm_id(gate_live_3d, cur_3d, mm_ids);
+                    ggml_tensor * act_up   = build_lora_mm_id(up_live_3d,   cur_3d, mm_ids);
+                    ggml_tensor * swiglu   = ggml_swiglu_split(ctx0, act_gate, act_up);
+                    cb(swiglu, "magnet_swiglu_paged", il);
+
+                    ggml_tensor * down_out = build_lora_mm_id(down_live_3d, swiglu, mm_ids);
+                    cb(down_out, "magnet_down_paged", il);
+
+                    mg_out = helix_sum_dim1_rows(ctx0, down_out, n_embd_cur, n_ffn_tokens);
+                } else {
+                    // FAST PATH: masked dense matmuls — same speed as baseline.
+                    // Weights stay on GPU, sparsity is applied as a mask.
+                    ggml_tensor * mg_mask = use_dynamic
+                        ? helix_magnet_build_dynamic_mask(ctx0, magnet_scores, il)
+                        : helix_magnet_build_topk_mask(ctx0, magnet_scores, (int) gather_k);
+                    cb(mg_mask, "magnet_mask", il);
+
+                    ggml_tensor * act_gate = ggml_mul_mat(ctx0, ffn_gate, cur_f32_mg);
+                    ggml_tensor * act_up   = ggml_mul_mat(ctx0, ffn_up, cur_f32_mg);
+                    ggml_tensor * z_full   = ggml_mul(ctx0, ggml_silu(ctx0, act_gate), act_up);
+                    ggml_tensor * z_sparse = ggml_mul(ctx0, z_full, mg_mask);
+                    cb(z_sparse, "magnet_swiglu_masked", il);
+
+                    mg_out = ggml_mul_mat(ctx0, ffn_down, z_sparse);
+                }
                 cb(mg_out, "magnet_ffn_out", il);
             } else if (sparse_mode) {
                 ggml_tensor * selected = ggml_cont(ctx0, ggml_argsort_top_k(ctx0, magnet_scores, (int) active_k));
