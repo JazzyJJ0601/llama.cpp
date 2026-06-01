@@ -647,116 +647,39 @@ int llama_cli(int argc, char ** argv) {
         if (params.show_timings) {
             console::set_display(DISPLAY_TYPE_INFO);
             console::log("\n");
-            if (std::getenv("HELIX_DOPPELGANGER")) {
-                helix_sparsity_stats st0 {};
-                helix_profile_stats  pr0 {};
-                const bool has_st = llama_helix_sparsity_get(&st0) && st0.engine_active;
-                const bool has_pr = llama_helix_profile_get(&pr0);
-                if (has_st && st0.active_neuron_measured && st0.decode_total_neurons > 0) {
-                    const uint64_t skipped = st0.decode_total_neurons - st0.decode_active_neurons;
-                    console::log("[ Prompt: %.1f t/s | Generation: %.1f t/s | Neurons: %llu loaded, %llu skipped (%.1f%%) | VRAM saved: ~%.0f MiB ]\n",
-                        timings.prompt_per_second, timings.predicted_per_second,
-                        (unsigned long long) st0.decode_active_neurons,
-                        (unsigned long long) skipped,
-                        st0.active_neuron_decode_pct,
-                        st0.vram_saved_mib);
-                } else if (has_pr) {
-                    console::log("[ Prompt: %.1f t/s | Generation: %.1f t/s | mean %.1f%% active (%lld / %lld neurons) ]\n",
-                        timings.prompt_per_second, timings.predicted_per_second,
-                        pr0.mean_active_pct,
-                        (long long) pr0.mean_active_neurons,
-                        (long long) pr0.mean_total_neurons);
-                } else {
-                    console::log("[ Prompt: %.1f t/s | Generation: %.1f t/s ]\n",
-                        timings.prompt_per_second, timings.predicted_per_second);
-                }
-                if (has_pr) {
-                    console::log("[ Profile: %d tokens | mean %.1f%% | min %.1f%% | p50 %.1f%% | p95 %.1f%% | max %.1f%% ]\n",
-                        pr0.n_tokens, pr0.mean_active_pct,
-                        pr0.min_active_pct, pr0.p50_active_pct,
-                        pr0.p95_active_pct, pr0.max_active_pct);
-                }
-                if (has_st && (st0.cache_rows_fetched > 0 || st0.cache_rows_hit > 0)) {
-                    console::log("[ Cache: %.1f%% hit | %llu fetched, %llu cached ]\n",
-                        st0.cache_hit_rate_pct,
-                        (unsigned long long) st0.cache_rows_fetched,
-                        (unsigned long long) st0.cache_rows_hit);
-                }
-            } else {
-                console::log("[ Prompt: %.1f t/s | Generation: %.1f t/s ]\n",
-                    timings.prompt_per_second, timings.predicted_per_second);
-            }
+            console::log("[ Prompt: %.1f t/s | Generation: %.1f t/s ]\n",
+                timings.prompt_per_second, timings.predicted_per_second);
+
             if (std::getenv("HELIX_DOPPELGANGER")) {
                 helix_sparsity_stats st {};
-                if (llama_helix_sparsity_get(&st) && st.engine_active) {
-                    const bool sparse_gather = std::getenv("HELIX_MAGNET_GATHER") != nullptr;
-                    const bool sparse_ffn    = std::getenv("HELIX_MAGNET_SPARSE") != nullptr;
-                    const char * ffn_mode = sparse_gather ? "row gather"
-                        : (sparse_ffn ? "top-k masked" : "dense");
-                    const bool mask_applied = std::getenv("HELIX_MAGNET_APPLY_MASK") != nullptr;
-                    if (st.n_magnet_layers > 0) {
-                        if (st.active_neuron_measured) {
-                            const bool paged = std::getenv("HELIX_MAGNET_PAGED") != nullptr;
-                            console::log(
-                                "[ Helix Magnet: %d magnet + %d dense | FFN %s%s ]\n",
-                                st.n_magnet_layers, st.n_dense_layers, ffn_mode,
-                                paged ? " + paged" : "");
-                            if (st.decode_total_neurons > 0) {
-                                const uint64_t skipped = st.decode_total_neurons - st.decode_active_neurons;
-                                console::log(
-                                    "[ Neurons: %llu loaded, %llu skipped (%.1f%% active) ]\n",
-                                    (unsigned long long) st.decode_active_neurons,
-                                    (unsigned long long) skipped,
-                                    st.active_neuron_decode_pct);
-                            } else {
-                                console::log(
-                                    "[ Neurons: %.1f%% active (measured) | Budget: %.0f%% ]\n",
-                                    st.active_neuron_pct, st.active_budget_pct);
-                            }
-                            console::log(
-                                "[ VRAM saved: ~%.0f MiB | ~%.0f%% FFN FLOPs saved ]\n",
-                                st.vram_saved_mib, st.ffn_flop_saved_pct);
-                            if (st.cache_rows_fetched > 0 || st.cache_rows_hit > 0) {
-                                console::log(
-                                    "[ Cache: %.1f%% hit rate | %llu fetched, %llu cached ]\n",
-                                    st.cache_hit_rate_pct,
-                                    (unsigned long long) st.cache_rows_fetched,
-                                    (unsigned long long) st.cache_rows_hit);
-                            }
-                        } else {
-                            console::log(
-                                "[ Helix Magnet: %d magnet + %d dense | (no live mask samples — rebuild llama-cli) "
-                                "| %.1f%% sparse budget | FFN %s ]\n",
-                                st.n_magnet_layers, st.n_dense_layers, st.active_budget_pct,
-                                ffn_mode);
-                        }
-                    } else {
-                        if (st.active_neuron_measured) {
-                            console::log(
-                                "[ Helix Doppelgänger: %d gate-masked + %d dense | %.1f%% active (measured) "
-                                "| ~%.0f%% FFN FLOPs saved if masked ]\n",
-                                st.n_gate_layers, st.n_dense_layers, st.active_neuron_pct, st.ffn_flop_saved_pct);
-                        } else {
-                            console::log(
-                                "[ Helix Doppelgänger: %d gate-masked + %d dense | (no live samples) ]\n",
-                                st.n_gate_layers, st.n_dense_layers);
-                        }
-                    }
-                } else {
-                    console::log("[ Helix: HELIX_DOPPELGANGER on — magnet path not active (missing magnet tensors in GGUF?) ]\n");
+                helix_profile_stats  prof {};
+                llama_helix_sparsity_get(&st);
+                const bool has_prof = llama_helix_profile_get(&prof);
+
+                if (st.decode_total_neurons > 0) {
+                    const uint64_t skipped = st.decode_total_neurons - st.decode_active_neurons;
+                    console::log("[ Neurons: %llu loaded, %llu skipped (%.1f%% active) | VRAM saved: ~%.0f MiB ]\n",
+                        (unsigned long long) st.decode_active_neurons,
+                        (unsigned long long) skipped,
+                        st.active_neuron_decode_pct,
+                        st.vram_saved_mib);
+                } else if (st.active_neuron_measured) {
+                    console::log("[ Neurons: %.1f%% active | VRAM saved: ~%.0f MiB ]\n",
+                        st.active_neuron_pct, st.vram_saved_mib);
                 }
-                // Per-token activation profiler
-                helix_profile_stats prof {};
-                if (llama_helix_profile_get(&prof)) {
-                    console::log(
-                        "[ Profile: %d tokens | mean %.1f%% active | min %.1f%% | p50 %.1f%% | p95 %.1f%% | max %.1f%% ]\n",
+
+                if (has_prof) {
+                    console::log("[ Profile: %d tokens | mean %.1f%% | min %.1f%% | p50 %.1f%% | p95 %.1f%% | max %.1f%% ]\n",
                         prof.n_tokens, prof.mean_active_pct,
                         prof.min_active_pct, prof.p50_active_pct,
                         prof.p95_active_pct, prof.max_active_pct);
-                    console::log(
-                        "[ Profile: mean %lld / %lld neurons per token across all layers ]\n",
-                        (long long) prof.mean_active_neurons,
-                        (long long) prof.mean_total_neurons);
+                }
+
+                if (st.cache_rows_fetched > 0 || st.cache_rows_hit > 0) {
+                    console::log("[ Cache: %.1f%% hit | %llu fetched, %llu cached ]\n",
+                        st.cache_hit_rate_pct,
+                        (unsigned long long) st.cache_rows_fetched,
+                        (unsigned long long) st.cache_rows_hit);
                 }
             }
             console::set_display(DISPLAY_TYPE_RESET);
