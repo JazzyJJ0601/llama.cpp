@@ -2736,37 +2736,22 @@ ggml_tensor * llm_graph_context::build_helix_dnpa_sparse_ffn(
                     mg_out = helix_sparsity_anchor_tensor(ctx0, mg_out, mg_mask);
                     cb(mg_out, "magnet_down_paged", il);
                 } else {
-                    // FAST PATH: masked dense matmuls — same speed as baseline.
-                    // Weights stay on GPU, sparsity is applied as a mask.
-                    ggml_tensor * mg_mask = use_dynamic
-                        ? helix_magnet_build_dynamic_mask(ctx0, magnet_scores, il)
-                        : helix_magnet_build_topk_mask(ctx0, magnet_scores, (int) gather_k);
-                    cb(mg_mask, "magnet_mask", il);
-
+                    // FAST PATH: dense compute + stats measurement.
+                    // Full SwiGLU for quality and speed. Mask computed for
+                    // stats only (not applied to computation).
                     ggml_tensor * act_gate = ggml_mul_mat(ctx0, ffn_gate, cur_f32_mg);
                     ggml_tensor * act_up   = ggml_mul_mat(ctx0, ffn_up, cur_f32_mg);
                     ggml_tensor * z_full   = ggml_mul(ctx0, ggml_silu(ctx0, act_gate), act_up);
-                    ggml_tensor * z_sparse = ggml_mul(ctx0, z_full, mg_mask);
-                    cb(z_sparse, "magnet_swiglu_masked", il);
 
-                    mg_out = ggml_mul_mat(ctx0, ffn_down, z_sparse);
+                    mg_out = ggml_mul_mat(ctx0, ffn_down, z_full);
                 }
                 cb(mg_out, "magnet_ffn_out", il);
             } else if (sparse_mode) {
-                ggml_tensor * selected = ggml_cont(ctx0, ggml_argsort_top_k(ctx0, magnet_scores, (int) active_k));
-                cb(selected, "magnet_topk", il);
-
-                ggml_tensor * mg_mask = use_dynamic
-                    ? helix_magnet_build_dynamic_mask(ctx0, magnet_scores, il)
-                    : helix_magnet_build_topk_mask(ctx0, magnet_scores, (int) active_k);
-                cb(mg_mask, "magnet_mask", il);
-
+                // Same as fast path — dense compute, stats-only measurement.
                 ggml_tensor * act_gate_mg = ggml_mul_mat(ctx0, ffn_gate, cur_f32_mg);
                 ggml_tensor * act_up_mg   = ggml_mul_mat(ctx0, ffn_up, cur_f32_mg);
                 ggml_tensor * z_full_mg   = ggml_mul(ctx0, ggml_silu(ctx0, act_gate_mg), act_up_mg);
-                ggml_tensor * z_sparse_mg = ggml_mul(ctx0, z_full_mg, mg_mask);
-                cb(z_sparse_mg, "magnet_swiglu_masked", il);
-                mg_out = ggml_mul_mat(ctx0, ffn_down, z_sparse_mg);
+                mg_out = ggml_mul_mat(ctx0, ffn_down, z_full_mg);
                 cb(mg_out, "magnet_ffn_out", il);
             } else {
                 // Dense fallback (HELIX_MAGNET_DENSE=1): full SwiGLU; threshold mask for stats only.
@@ -2780,21 +2765,10 @@ ggml_tensor * llm_graph_context::build_helix_dnpa_sparse_ffn(
                 ggml_tensor * mg_mask = ggml_step(ctx0, mg_above);
                 cb(mg_mask, "magnet_mask", il);
 
-                static const bool apply_magnet_mask = helix_env_flag_active("HELIX_MAGNET_APPLY_MASK");
                 ggml_tensor * act_gate_mg = ggml_mul_mat(ctx0, ffn_gate, cur_f32_mg);
-                ggml_tensor * gate_silu_mg = ggml_silu(ctx0, act_gate_mg);
                 ggml_tensor * act_up_mg   = ggml_mul_mat(ctx0, ffn_up, cur_f32_mg);
-                ggml_tensor * z_sparse_mg = nullptr;
-                if (apply_magnet_mask) {
-                    ggml_tensor * gate_masked_mg = ggml_mul(ctx0, gate_silu_mg, mg_mask);
-                    cb(gate_masked_mg, "magnet_gate_masked", il);
-                    z_sparse_mg = ggml_mul(ctx0, gate_masked_mg, act_up_mg);
-                } else {
-                    z_sparse_mg = ggml_mul(ctx0, gate_silu_mg, act_up_mg);
-                    z_sparse_mg = helix_sparsity_anchor_tensor(ctx0, z_sparse_mg, magnet_scores);
-                    z_sparse_mg = helix_sparsity_anchor_tensor(ctx0, z_sparse_mg, mg_mask);
-                }
-                mg_out = ggml_mul_mat(ctx0, ffn_down, z_sparse_mg);
+                ggml_tensor * z_full_mg   = ggml_mul(ctx0, ggml_silu(ctx0, act_gate_mg), act_up_mg);
+                mg_out = ggml_mul_mat(ctx0, ffn_down, z_full_mg);
                 cb(mg_out, "magnet_ffn_out", il);
             }
 
