@@ -2640,7 +2640,7 @@ ggml_tensor * llm_graph_context::build_helix_dnpa_sparse_ffn(
     // active rows from gate/up/down for physically smaller matmuls.
     // When magnet tensors are absent, falls back to analytical gate masking.
     // =========================================================================
-    if (helix_doppelganger_enabled() && ffn_gate != nullptr && ffn_up != nullptr && ffn_down != nullptr) {
+    if (ffn_gate != nullptr && ffn_up != nullptr && ffn_down != nullptr) {
         // Magnet path: predict active neurons via low-rank projection (6x cheaper than gate)
         if (helix_magnet_a != nullptr && helix_magnet_b != nullptr) {
             g_helix_sparsity.layer_magnet[il] = true;
@@ -3294,8 +3294,9 @@ ggml_tensor * llm_graph_context::build_ffn(
         ffn_down->ne[0] == 6144 && ffn_down->ne[1] == 2048 &&
         ffn_gate->ne[0] == 2048 && ffn_gate->ne[1] == 6144;
 
-    // Magnet-only GGUF (helix_magnet_a/b embedded, no DNPA sidecar tensors)
-    if (helix_doppelganger_enabled() && helix_qwen_ffn &&
+    // Magnet-only GGUF (helix_magnet_a/b embedded, no DNPA sidecar tensors).
+    // Activates automatically when magnet tensors are present in the GGUF.
+    if (helix_qwen_ffn &&
         helix_magnet_a != nullptr && helix_magnet_b != nullptr) {
         ggml_tensor * helix_out = build_helix_dnpa_sparse_ffn(
             ctx0, cur, ffn_up, ffn_gate, ffn_down,
