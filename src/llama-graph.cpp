@@ -2606,41 +2606,57 @@ ggml_tensor * llm_graph_context::build_helix_dnpa_sparse_ffn(
                     helix_ffn_down_live != nullptr;
 
                 if (use_paged) {
-                    // PAGED PROOF-OF-CONCEPT PATH: FFN weights on CPU pinned
-                    // memory, gather only selected rows into GPU _live scratchpads
-                    // via get_rows+cpy, then mul_mat_id on the small slab.
-                    // Slower than dense due to mul_mat_id dispatch overhead, but
-                    // demonstrates real VRAM offloading visible in nvidia-smi.
-                    ggml_tensor * cur_3d = ggml_reshape_3d(ctx0, cur_f32_mg, n_embd_cur, 1, n_ffn_tokens);
+                    // PAGED PATH: FFN weights on CPU pinned memory, gather
+                    // selected rows into GPU _live scratchpads (F16) via
+                    // get_rows+cpy, then direct mul_mat on the contiguous 2D
+                    // slabs.  No mul_mat_id, no 3D reshapes, no expert dispatch.
+                    //
+                    // After pack_rows, the scratchpads hold contiguous slabs:
+                    //   gate_live [n_embd, k_max]  — selected gate rows
+                    //   up_live   [n_embd, k_max]  — selected up rows
+                    //   down_live [k_max, n_embd]  — selected down rows
+                    // Direct mul_mat on these gives the same result as the
+                    // dense path but with physically smaller matrices.
 
+                    // Reshape source weights to 3D for get_rows indexing
                     ggml_tensor * gate_as = ggml_reshape_3d(ctx0, ffn_gate, n_embd_cur, 1, n_ff);
                     ggml_tensor * up_as   = ggml_reshape_3d(ctx0, ffn_up,   n_embd_cur, 1, n_ff);
-                    ggml_tensor * down_f32 = ggml_cont(ctx0, ggml_cast(ctx0, ffn_down, GGML_TYPE_F32));
-                    ggml_tensor * down_as = ggml_reshape_3d(ctx0, down_f32, 1, n_embd_cur, n_ff);
 
+                    // Pack selected gate/up rows from CPU → GPU scratchpads
                     ggml_tensor * gate_live_3d = ggml_reshape_3d(ctx0, helix_ffn_gate_live, n_embd_cur, 1, k_max);
                     ggml_tensor * up_live_3d   = ggml_reshape_3d(ctx0, helix_ffn_up_live,   n_embd_cur, 1, k_max);
-                    ggml_tensor * down_live_3d = ggml_reshape_3d(ctx0, helix_ffn_down_live, 1, n_embd_cur, k_max);
-
                     ggml_tensor * gate_packed = helix_graph_paged_pack_rows(ctx0, gate_as, selected, gate_live_3d, gather_k);
                     ggml_tensor * up_packed   = helix_graph_paged_pack_rows(ctx0, up_as,   selected, up_live_3d,   gather_k);
-                    ggml_tensor * down_packed = helix_graph_paged_pack_rows(ctx0, down_as, selected, down_live_3d, gather_k);
-                    cb(gate_packed, "magnet_paged_gate", il);
-                    cb(up_packed,   "magnet_paged_up",   il);
-                    cb(down_packed, "magnet_paged_down", il);
 
-                    ggml_tensor * mm_ids = helix_graph_seq_indices(ctx0, gather_k, n_ffn_tokens);
-                    cb(mm_ids, "magnet_paged_ids", il);
+                    // Anchor the pack ops so the graph evaluates them before
+                    // the mul_mat reads the scratchpad contents.
+                    ggml_tensor * gate_ready = ggml_reshape_2d(ctx0, gate_packed, n_embd_cur, gather_k);
+                    ggml_tensor * up_ready   = ggml_reshape_2d(ctx0, up_packed,   n_embd_cur, gather_k);
 
-                    ggml_tensor * act_gate = build_lora_mm_id(gate_live_3d, cur_3d, mm_ids);
-                    ggml_tensor * act_up   = build_lora_mm_id(up_live_3d,   cur_3d, mm_ids);
-                    ggml_tensor * swiglu   = ggml_swiglu_split(ctx0, act_gate, act_up);
+                    // Direct mul_mat on packed 2D scratchpads:
+                    // [n_embd, k_max] × [n_embd, n_tokens] → [k_max, n_tokens]
+                    ggml_tensor * act_gate = ggml_mul_mat(ctx0, gate_ready, cur_f32_mg);
+                    ggml_tensor * act_up   = ggml_mul_mat(ctx0, up_ready,   cur_f32_mg);
+                    cb(act_gate, "magnet_gate_paged", il);
+                    cb(act_up,   "magnet_up_paged",   il);
+
+                    ggml_tensor * swiglu = ggml_swiglu_split(ctx0, act_gate, act_up);
                     cb(swiglu, "magnet_swiglu_paged", il);
 
-                    ggml_tensor * down_out = build_lora_mm_id(down_live_3d, swiglu, mm_ids);
-                    cb(down_out, "magnet_down_paged", il);
+                    // Down: ffn_down is [n_ff, n_embd].  Reshape to 3D as
+                    // [1, n_embd, n_ff] so get_rows selects along the neuron
+                    // axis (ne[2]).  F16 allows ne[0]=1 (blck_size=1).
+                    // down_live is [k_max, n_embd]; after packing it holds the
+                    // selected neuron rows.
+                    // mul_mat(down_live, swiglu): [k_max, n_embd]^T @ [k_max, n_tokens]
+                    // → [n_embd, n_tokens] ✓
+                    ggml_tensor * down_3d = ggml_reshape_3d(ctx0, ffn_down, 1, n_embd_cur, n_ff);
+                    ggml_tensor * down_live_3d = ggml_reshape_3d(ctx0, helix_ffn_down_live, 1, n_embd_cur, k_max);
+                    ggml_tensor * down_packed = helix_graph_paged_pack_rows(ctx0, down_3d, selected, down_live_3d, gather_k);
+                    ggml_tensor * down_ready = ggml_reshape_2d(ctx0, down_packed, gather_k, n_embd_cur);
 
-                    mg_out = helix_sum_dim1_rows(ctx0, down_out, n_embd_cur, n_ffn_tokens);
+                    mg_out = ggml_mul_mat(ctx0, down_ready, swiglu);
+                    cb(mg_out, "magnet_down_paged", il);
                 } else {
                     // FAST PATH: masked dense matmuls — same speed as baseline.
                     // Weights stay on GPU, sparsity is applied as a mask.
